@@ -41,7 +41,7 @@ _THRESH_CONFIG = {
     "Low_SNR": {"min": 0.0, "max": 50.0, "step": 1.0, "format": "%.0f"},
 }
 _FLAG_NAMES = list(_THRESH_CONFIG.keys())
-_ALL_FLAG_NAMES = _FLAG_NAMES + ["QRS_Count_Mismatch"]
+_ALL_FLAG_NAMES = _FLAG_NAMES + ["NK_Peak_Consistency"]
 _PRESET_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 # -- Page config ---------------------------------------------------------------
@@ -104,7 +104,7 @@ def _populate_config_state(preset_name: str) -> None:
         )
         st.session_state[f"cfg_thresh_{flag_name}_low"] = float(bounds[0])
         st.session_state[f"cfg_thresh_{flag_name}_high"] = float(bounds[1])
-    # Weights — fill all known flags (including QRS_Count_Mismatch)
+    # Weights — fill all known flags, including NK peak consistency
     weights = preset.get("flags_weights", {})
     for flag_name in _ALL_FLAG_NAMES:
         st.session_state[f"cfg_weight_{flag_name}"] = float(
@@ -130,12 +130,12 @@ if "_pending_preset" in st.session_state:
 elif "cfg_thresh_Muscle_Artifact_low" not in st.session_state:
     _populate_config_state(st.session_state["cfg_preset"])
 # Backfill new weight keys added after initial session was created
-elif "cfg_weight_QRS_Count_Mismatch" not in st.session_state:
+elif "cfg_weight_NK_Peak_Consistency" not in st.session_state:
     _w = _cached_load_presets().get("presets", {}).get(
         st.session_state.get("cfg_preset", ""), {}
     ).get("flags_weights", {})
-    st.session_state["cfg_weight_QRS_Count_Mismatch"] = float(
-        _w.get("QRS_Count_Mismatch", 0.10)
+    st.session_state["cfg_weight_NK_Peak_Consistency"] = float(
+        _w.get("NK_Peak_Consistency", 0.10)
     )
 
 
@@ -900,6 +900,14 @@ for tab, (fname, result) in zip(tabs, all_results.items()):
                     elif nk_enabled:
                         score_parts.append("NK: N/A")
                     st.caption(" | ".join(score_parts))
+                    window_stats = q.get(f"lead{lead_num}_window_stats", {})
+                    if window_stats:
+                        st.caption(
+                            "Window agg: "
+                            f"mean={window_stats.get('mean', 0.0):.3f} | "
+                            f"p25={window_stats.get('p25', 0.0):.3f} | "
+                            f"coverage={window_stats.get('coverage', 0.0):.0%}"
+                        )
 
                     # Flags
                     st.markdown("**Flags**")
@@ -920,6 +928,8 @@ for tab, (fname, result) in zip(tabs, all_results.items()):
                         _meas_labels = {
                             "snr": ("SNR", "dB", "%.1f"),
                             "qrs_amp": ("QRS Amplitude", "", "%.1f"),
+                            "qrs_band_amp": ("QRS Band Amplitude", "", "%.1f"),
+                            "hf_noise_rms": ("HF Noise RMS", "", "%.2f"),
                             "m_a": ("Muscle Artifact Ratio", "", "%.4f"),
                             "p_i": ("Powerline Interference", "", "%.4f"),
                             "b_d": ("Baseline Drift Ratio", "", "%.4f"),
@@ -929,17 +939,43 @@ for tab, (fname, result) in zip(tabs, all_results.items()):
                             if v is not None:
                                 suffix = f" {unit}" if unit else ""
                                 st.caption(f"{label}: {fmt % v}{suffix}")
-                        csharp_qrs = vals.get("csharp_qrs_count")
-                        if csharp_qrs is not None:
-                            st.caption(f"C# QRS count: {csharp_qrs}")
                         if nk_enabled:
                             nk_peaks = vals.get("nk_r_peaks_count", 0)
                             st.caption(f"NK R-peaks detected: {nk_peaks}")
+                            rr_median = vals.get("nk_rr_median_sec")
+                            if rr_median is not None:
+                                st.caption(f"NK median RR: {rr_median:.3f} s")
+                            peak_density = vals.get("nk_peak_density_bpm")
+                            if peak_density is not None:
+                                st.caption(f"NK peak density: {peak_density:.1f} BPM")
+                            peak_span = vals.get("nk_peak_span_ratio")
+                            if peak_span is not None:
+                                st.caption(f"NK peak span ratio: {peak_span:.1%}")
+                            rr_short_ratio = vals.get("nk_rr_short_ratio")
+                            if rr_short_ratio is not None:
+                                st.caption(
+                                    f"NK too-short RR ratio: {rr_short_ratio:.1%}"
+                                )
+                            rr_dup_ratio = vals.get("nk_rr_duplicate_ratio")
+                            if rr_dup_ratio is not None:
+                                st.caption(
+                                    f"NK duplicate-like RR ratio: {rr_dup_ratio:.1%}"
+                                )
+                            long_gap_ratio = vals.get("nk_long_gap_ratio")
+                            if long_gap_ratio is not None:
+                                st.caption(
+                                    f"NK long-gap ratio: {long_gap_ratio:.1%}"
+                                )
+                            max_gap = vals.get("nk_max_gap_sec")
+                            if max_gap is not None:
+                                st.caption(f"NK max gap: {max_gap:.2f} s")
 
             # Preset & window info
             st.caption(
                 f"Preset: {q.get('preset', 'N/A')} | "
                 f"Best windows: {q.get('best_window_start', 0)}-{q.get('best_window_end', 0)} | "
+                f"Window: {q.get('window_length_sec', 5.0):.1f}s / "
+                f"step {q.get('window_step_sec', 1.0):.1f}s | "
                 f"Quality best lead: {q.get('quality_best_lead', 'N/A')}"
             )
 
@@ -983,7 +1019,11 @@ for tab, (fname, result) in zip(tabs, all_results.items()):
                     annotation_text="Best",
                 )
                 win_fig.update_layout(
-                    title="Quality per Window (5s each)",
+                    title=(
+                        f"Quality per Window "
+                        f"({q.get('window_length_sec', 5.0):.1f}s, "
+                        f"step {q.get('window_step_sec', 1.0):.1f}s)"
+                    ),
                     xaxis_title="Window",
                     yaxis_title="Quality Score",
                     yaxis_range=[0, 1.05],
