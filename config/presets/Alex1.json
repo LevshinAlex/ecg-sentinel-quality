@@ -1,0 +1,57 @@
+{
+  "thresholds": {
+    "Muscle_Artifact": [
+      0.03,
+      0.1
+    ],
+    "Bad_Electrode_Contact": [
+      10.0,
+      800.0
+    ],
+    "Powerline_Interference": [
+      0.01,
+      0.05
+    ],
+    "Periodic_Artifact": [
+      0.1,
+      0.45
+    ],
+    "Baseline_Drift": [
+      0.03,
+      0.9
+    ],
+    "Low_SNR": [
+      22.0,
+      12.0
+    ]
+  },
+  "flags_weights": {
+    "Noise_Artifact": 0.2,
+    "Bad_Electrode_Contact": 0.2,
+    "Baseline_Drift": 0.15,
+    "Low_SNR": 0.15
+  },
+  "neurokit": {
+    "enabled": true,
+    "method": "averageQRS",
+    "weight": 0.35
+  },
+  "readability_relief": {
+    "enabled": true,
+    "support_threshold": 0.45,
+    "support_full": 0.75,
+    "morph_threshold": 0.7,
+    "morph_full": 0.9,
+    "noise_reference": 0.35,
+    "low_snr_reference": 0.35,
+    "max_bonus": 0.18
+  },
+  "grade_thresholds": {
+    "good": 0.85,
+    "questionable": 0.65
+  },
+  "_threshold_docs": {
+    "format": "[boundary_low, boundary_high] \u2014 flag severity interpolated 0-1 between boundaries",
+    "Low_SNR": "INVERTED: [good_threshold, bad_threshold] \u2014 high SNR maps to low flag severity, low SNR maps to high severity"
+  }
+}

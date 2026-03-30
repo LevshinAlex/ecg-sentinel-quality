@@ -34,6 +34,23 @@
     "method": "averageQRS",
     "weight": 0.15
   },
+  "baseline_visibility": {
+    "enabled": true,
+    "chunk_sec": 0.4,
+    "good_ratio": 0.06,
+    "bad_ratio": 0.25
+  },
+  "readability_relief": {
+    "enabled": true,
+    "support_threshold": 0.45,
+    "support_full": 0.75,
+    "morph_threshold": 0.70,
+    "morph_full": 0.90,
+    "noise_reference": 0.55,
+    "low_snr_reference": 0.85,
+    "max_bonus": 0.18,
+    "legacy_max_bonus": 0.0
+  },
   "grade_thresholds": {
     "good": 0.85,
     "questionable": 0.65
@@ -41,5 +58,21 @@
   "_threshold_docs": {
     "format": "[boundary_low, boundary_high] \u2014 flag severity interpolated 0-1 between boundaries",
     "Low_SNR": "INVERTED: [good_threshold, bad_threshold] \u2014 high SNR maps to low flag severity, low SNR maps to high severity"
+  },
+  "_readability_relief_docs": {
+    "purpose": "Small bonus for low-gain but clearly readable ECG when NK morphology and coverage stay good.",
+    "legacy_mode": "Set max_bonus to 0.0 to restore pre-relief behaviour.",
+    "support_threshold": "Readability support value where relief starts.",
+    "support_full": "Readability support value where relief reaches full strength.",
+    "morph_threshold": "Morphology support value where relief starts.",
+    "morph_full": "Morphology support value where relief reaches full strength.",
+    "noise_reference": "Noise_Artifact level treated as full penalty pressure for relief scaling.",
+    "low_snr_reference": "Low_SNR level treated as full penalty pressure for relief scaling."
+  },
+  "_baseline_visibility_docs": {
+    "purpose": "Supplement residual LF-power drift with visible baseline movement inside the displayed window.",
+    "chunk_sec": "Median is computed per chunk of this duration inside each analysis window.",
+    "good_ratio": "Visible baseline ratio where drift penalty starts.",
+    "bad_ratio": "Visible baseline ratio where visible drift reaches full severity."
   }
 }

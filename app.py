@@ -42,7 +42,7 @@ _THRESH_CONFIG = {
     "Low_SNR": {"min": 0.0, "max": 50.0, "step": 1.0, "format": "%.0f"},
 }
 _FLAG_NAMES = list(_THRESH_CONFIG.keys())
-_ALL_FLAG_NAMES = _FLAG_NAMES + ["NK_Peak_Consistency"]
+_ALL_FLAG_NAMES = ["Noise_Artifact", "Bad_Electrode_Contact", "Baseline_Drift", "Low_SNR"]
 _PRESET_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 # -- Page config ---------------------------------------------------------------
@@ -120,6 +120,27 @@ def _populate_config_state(preset_name: str) -> None:
     st.session_state["cfg_nk_enabled"] = bool(nk.get("enabled", False))
     st.session_state["cfg_nk_method"] = nk.get("method", "averageQRS")
     st.session_state["cfg_nk_weight"] = float(nk.get("weight", 0.0))
+    relief = preset.get("readability_relief", {})
+    st.session_state["cfg_relief_enabled"] = bool(relief.get("enabled", True))
+    st.session_state["cfg_relief_support_threshold"] = float(
+        relief.get("support_threshold", 0.45)
+    )
+    st.session_state["cfg_relief_support_full"] = float(
+        relief.get("support_full", 0.75)
+    )
+    st.session_state["cfg_relief_morph_threshold"] = float(
+        relief.get("morph_threshold", 0.70)
+    )
+    st.session_state["cfg_relief_morph_full"] = float(
+        relief.get("morph_full", 0.90)
+    )
+    st.session_state["cfg_relief_noise_reference"] = float(
+        relief.get("noise_reference", 0.55)
+    )
+    st.session_state["cfg_relief_low_snr_reference"] = float(
+        relief.get("low_snr_reference", 0.85)
+    )
+    st.session_state["cfg_relief_max_bonus"] = float(relief.get("max_bonus", 0.18))
 
 
 # Handle pending preset switch (set before rerun from save-as-new flow)
@@ -130,14 +151,88 @@ if "_pending_preset" in st.session_state:
 # Populate defaults on first run (or when new config keys are missing)
 elif "cfg_thresh_Muscle_Artifact_low" not in st.session_state:
     _populate_config_state(st.session_state["cfg_preset"])
-# Backfill new weight keys added after initial session was created
-elif "cfg_weight_NK_Peak_Consistency" not in st.session_state:
-    _w = _cached_load_presets().get("presets", {}).get(
-        st.session_state.get("cfg_preset", ""), {}
-    ).get("flags_weights", {})
-    st.session_state["cfg_weight_NK_Peak_Consistency"] = float(
-        _w.get("NK_Peak_Consistency", 0.10)
-    )
+# Backfill config keys added after initial session was created
+else:
+    _preset_name = st.session_state.get("cfg_preset", _default_preset)
+    _preset = _cached_load_presets().get("presets", {}).get(_preset_name, {})
+    _fallback_thresholds = {
+        "Muscle_Artifact": (0.045, 0.10),
+        "Bad_Electrode_Contact": (10.0, 800.0),
+        "Powerline_Interference": (0.01, 0.05),
+        "Periodic_Artifact": (0.10, 0.45),
+        "Baseline_Drift": (0.03, 0.90),
+        "Low_SNR": (22.0, 12.0),
+    }
+    _fallback_weights = {
+        "Noise_Artifact": 0.35,
+        "Bad_Electrode_Contact": 0.15,
+        "Baseline_Drift": 0.10,
+        "Low_SNR": 0.40,
+    }
+    _preset_thresholds = _preset.get("thresholds", {})
+    _preset_weights = _preset.get("flags_weights", {})
+    _preset_grades = _preset.get("grade_thresholds", {})
+    _preset_nk = _preset.get("neurokit", {})
+
+    for flag_name in _FLAG_NAMES:
+        low_key = f"cfg_thresh_{flag_name}_low"
+        high_key = f"cfg_thresh_{flag_name}_high"
+        bounds = _preset_thresholds.get(flag_name, _fallback_thresholds.get(flag_name, (0.0, 1.0)))
+        if low_key not in st.session_state:
+            st.session_state[low_key] = float(bounds[0])
+        if high_key not in st.session_state:
+            st.session_state[high_key] = float(bounds[1])
+
+    for flag_name in _ALL_FLAG_NAMES:
+        weight_key = f"cfg_weight_{flag_name}"
+        if weight_key not in st.session_state:
+            st.session_state[weight_key] = float(
+                _preset_weights.get(flag_name, _fallback_weights.get(flag_name, 0.2))
+            )
+
+    if "cfg_grade_good" not in st.session_state:
+        st.session_state["cfg_grade_good"] = float(_preset_grades.get("good", 0.85))
+    if "cfg_grade_questionable" not in st.session_state:
+        st.session_state["cfg_grade_questionable"] = float(
+            _preset_grades.get("questionable", 0.65)
+        )
+    if "cfg_nk_enabled" not in st.session_state:
+        st.session_state["cfg_nk_enabled"] = bool(_preset_nk.get("enabled", False))
+    if "cfg_nk_method" not in st.session_state:
+        st.session_state["cfg_nk_method"] = _preset_nk.get("method", "averageQRS")
+    if "cfg_nk_weight" not in st.session_state:
+        st.session_state["cfg_nk_weight"] = float(_preset_nk.get("weight", 0.0))
+    _preset_relief = _preset.get("readability_relief", {})
+    if "cfg_relief_enabled" not in st.session_state:
+        st.session_state["cfg_relief_enabled"] = bool(_preset_relief.get("enabled", True))
+    if "cfg_relief_support_threshold" not in st.session_state:
+        st.session_state["cfg_relief_support_threshold"] = float(
+            _preset_relief.get("support_threshold", 0.45)
+        )
+    if "cfg_relief_support_full" not in st.session_state:
+        st.session_state["cfg_relief_support_full"] = float(
+            _preset_relief.get("support_full", 0.75)
+        )
+    if "cfg_relief_morph_threshold" not in st.session_state:
+        st.session_state["cfg_relief_morph_threshold"] = float(
+            _preset_relief.get("morph_threshold", 0.70)
+        )
+    if "cfg_relief_morph_full" not in st.session_state:
+        st.session_state["cfg_relief_morph_full"] = float(
+            _preset_relief.get("morph_full", 0.90)
+        )
+    if "cfg_relief_noise_reference" not in st.session_state:
+        st.session_state["cfg_relief_noise_reference"] = float(
+            _preset_relief.get("noise_reference", 0.55)
+        )
+    if "cfg_relief_low_snr_reference" not in st.session_state:
+        st.session_state["cfg_relief_low_snr_reference"] = float(
+            _preset_relief.get("low_snr_reference", 0.85)
+        )
+    if "cfg_relief_max_bonus" not in st.session_state:
+        st.session_state["cfg_relief_max_bonus"] = float(
+            _preset_relief.get("max_bonus", 0.18)
+        )
 
 
 def _on_preset_change() -> None:
@@ -165,6 +260,16 @@ def _build_quality_config() -> dict:
             "method": st.session_state.get("cfg_nk_method", "averageQRS"),
             "weight": st.session_state.get("cfg_nk_weight", 0.0),
         },
+        "readability_relief": {
+            "enabled": st.session_state.get("cfg_relief_enabled", True),
+            "support_threshold": st.session_state.get("cfg_relief_support_threshold", 0.45),
+            "support_full": st.session_state.get("cfg_relief_support_full", 0.75),
+            "morph_threshold": st.session_state.get("cfg_relief_morph_threshold", 0.70),
+            "morph_full": st.session_state.get("cfg_relief_morph_full", 0.90),
+            "noise_reference": st.session_state.get("cfg_relief_noise_reference", 0.55),
+            "low_snr_reference": st.session_state.get("cfg_relief_low_snr_reference", 0.85),
+            "max_bonus": st.session_state.get("cfg_relief_max_bonus", 0.18),
+        },
         "grade_thresholds": {
             "good": st.session_state.get("cfg_grade_good", 0.85),
             "questionable": st.session_state.get("cfg_grade_questionable", 0.65),
@@ -189,6 +294,17 @@ def _apply_optimized_config(config: dict) -> None:
     st.session_state["cfg_nk_enabled"] = bool(nk.get("enabled", False))
     st.session_state["cfg_nk_method"] = nk.get("method", "averageQRS")
     st.session_state["cfg_nk_weight"] = float(nk.get("weight", 0.0))
+    relief = config.get("readability_relief", {})
+    st.session_state["cfg_relief_enabled"] = bool(relief.get("enabled", True))
+    st.session_state["cfg_relief_support_threshold"] = float(relief.get("support_threshold", 0.45))
+    st.session_state["cfg_relief_support_full"] = float(relief.get("support_full", 0.75))
+    st.session_state["cfg_relief_morph_threshold"] = float(relief.get("morph_threshold", 0.70))
+    st.session_state["cfg_relief_morph_full"] = float(relief.get("morph_full", 0.90))
+    st.session_state["cfg_relief_noise_reference"] = float(relief.get("noise_reference", 0.55))
+    st.session_state["cfg_relief_low_snr_reference"] = float(
+        relief.get("low_snr_reference", 0.85)
+    )
+    st.session_state["cfg_relief_max_bonus"] = float(relief.get("max_bonus", 0.18))
 
 
 def _guess_grade(folder_name: str) -> str:
@@ -404,6 +520,71 @@ with st.sidebar:
             disabled=nk_disabled,
         )
 
+        # -- Readability Relief --
+        st.subheader("Readability Relief")
+        st.caption(
+            "Small bonus for low-gain but clearly readable ECG. "
+            "Set Max bonus to 0.0 to restore legacy behaviour."
+        )
+        st.toggle("Enable readability relief", key="cfg_relief_enabled")
+        relief_disabled = not st.session_state.get("cfg_relief_enabled", True)
+        st.slider(
+            "Support threshold",
+            min_value=0.0,
+            max_value=1.0,
+            step=0.01,
+            key="cfg_relief_support_threshold",
+            disabled=relief_disabled,
+        )
+        st.slider(
+            "Support full",
+            min_value=0.0,
+            max_value=1.0,
+            step=0.01,
+            key="cfg_relief_support_full",
+            disabled=relief_disabled,
+        )
+        st.slider(
+            "Morph threshold",
+            min_value=0.0,
+            max_value=1.0,
+            step=0.01,
+            key="cfg_relief_morph_threshold",
+            disabled=relief_disabled,
+        )
+        st.slider(
+            "Morph full",
+            min_value=0.0,
+            max_value=1.0,
+            step=0.01,
+            key="cfg_relief_morph_full",
+            disabled=relief_disabled,
+        )
+        st.slider(
+            "Noise reference",
+            min_value=0.0,
+            max_value=1.0,
+            step=0.01,
+            key="cfg_relief_noise_reference",
+            disabled=relief_disabled,
+        )
+        st.slider(
+            "Low SNR reference",
+            min_value=0.0,
+            max_value=1.0,
+            step=0.01,
+            key="cfg_relief_low_snr_reference",
+            disabled=relief_disabled,
+        )
+        st.slider(
+            "Max relief bonus",
+            min_value=0.0,
+            max_value=0.5,
+            step=0.01,
+            key="cfg_relief_max_bonus",
+            disabled=relief_disabled,
+        )
+
         # -- Save Preset --
         st.divider()
         st.subheader("Save Preset")
@@ -442,6 +623,18 @@ with st.sidebar:
                 _validation_errors.append(
                     f"Grade 'Good' ({_good}) must be > 'Questionable' ({_quest})"
                 )
+            _relief_support_threshold = st.session_state.get("cfg_relief_support_threshold", 0.45)
+            _relief_support_full = st.session_state.get("cfg_relief_support_full", 0.75)
+            if _relief_support_full < _relief_support_threshold:
+                _validation_errors.append(
+                    "Readability relief: Support full must be >= Support threshold"
+                )
+            _relief_morph_threshold = st.session_state.get("cfg_relief_morph_threshold", 0.70)
+            _relief_morph_full = st.session_state.get("cfg_relief_morph_full", 0.90)
+            if _relief_morph_full < _relief_morph_threshold:
+                _validation_errors.append(
+                    "Readability relief: Morph full must be >= Morph threshold"
+                )
 
             if _validation_errors:
                 for err in _validation_errors:
@@ -455,6 +648,28 @@ with st.sidebar:
                         "enabled": st.session_state.get("cfg_nk_enabled", False),
                         "method": st.session_state.get("cfg_nk_method", "averageQRS"),
                         "weight": st.session_state.get("cfg_nk_weight", 0.0),
+                    },
+                    "readability_relief": {
+                        "enabled": st.session_state.get("cfg_relief_enabled", True),
+                        "support_threshold": st.session_state.get(
+                            "cfg_relief_support_threshold", 0.45
+                        ),
+                        "support_full": st.session_state.get(
+                            "cfg_relief_support_full", 0.75
+                        ),
+                        "morph_threshold": st.session_state.get(
+                            "cfg_relief_morph_threshold", 0.70
+                        ),
+                        "morph_full": st.session_state.get(
+                            "cfg_relief_morph_full", 0.90
+                        ),
+                        "noise_reference": st.session_state.get(
+                            "cfg_relief_noise_reference", 0.55
+                        ),
+                        "low_snr_reference": st.session_state.get(
+                            "cfg_relief_low_snr_reference", 0.85
+                        ),
+                        "max_bonus": st.session_state.get("cfg_relief_max_bonus", 0.18),
                     },
                     "grade_thresholds": {
                         "good": _good,
@@ -492,6 +707,20 @@ with st.sidebar:
                         )
                         if current_docs:
                             _save_preset["_threshold_docs"] = current_docs
+                        current_baseline_docs = (
+                            _presets_data_current.get("presets", {})
+                            .get(st.session_state.get("cfg_preset", ""), {})
+                            .get("_baseline_visibility_docs")
+                        )
+                        if current_baseline_docs:
+                            _save_preset["_baseline_visibility_docs"] = current_baseline_docs
+                        current_relief_docs = (
+                            _presets_data_current.get("presets", {})
+                            .get(st.session_state.get("cfg_preset", ""), {})
+                            .get("_readability_relief_docs")
+                        )
+                        if current_relief_docs:
+                            _save_preset["_readability_relief_docs"] = current_relief_docs
                         save_preset(target_name, _save_preset)
                         _cached_load_presets.clear()
                         st.session_state["_pending_preset"] = target_name
@@ -503,6 +732,14 @@ with st.sidebar:
                     )
                     if "_threshold_docs" in existing:
                         _save_preset["_threshold_docs"] = existing["_threshold_docs"]
+                    if "_baseline_visibility_docs" in existing:
+                        _save_preset["_baseline_visibility_docs"] = existing[
+                            "_baseline_visibility_docs"
+                        ]
+                    if "_readability_relief_docs" in existing:
+                        _save_preset["_readability_relief_docs"] = existing[
+                            "_readability_relief_docs"
+                        ]
                     save_preset(target_name, _save_preset)
                     _cached_load_presets.clear()
                     st.success(f"Preset '{target_name}' saved.")
@@ -756,6 +993,18 @@ if process_btn:
     _q = st.session_state.get("cfg_grade_questionable", 0.65)
     if _g <= _q:
         _analysis_errors.append(f"Grade 'Good' ({_g}) must be > 'Questionable' ({_q})")
+    _relief_support_threshold = st.session_state.get("cfg_relief_support_threshold", 0.45)
+    _relief_support_full = st.session_state.get("cfg_relief_support_full", 0.75)
+    if _relief_support_full < _relief_support_threshold:
+        _analysis_errors.append(
+            "Readability relief: Support full must be >= Support threshold"
+        )
+    _relief_morph_threshold = st.session_state.get("cfg_relief_morph_threshold", 0.70)
+    _relief_morph_full = st.session_state.get("cfg_relief_morph_full", 0.90)
+    if _relief_morph_full < _relief_morph_threshold:
+        _analysis_errors.append(
+            "Readability relief: Morph full must be >= Morph threshold"
+        )
     if _analysis_errors:
         for ae in _analysis_errors:
             st.error(ae)
@@ -891,8 +1140,7 @@ for tab, (fname, result) in zip(tabs, all_results.items()):
 
                     # Scores
                     st.markdown(f"**Overall Quality: {blended:.3f}**")
-                    psd_best_q = q.get(f"lead{lead_num}_psd_best_quality", psd_q)
-                    score_parts = [f"PSD (all): {psd_q:.3f}", f"PSD (best): {psd_best_q:.3f}"]
+                    score_parts = [f"PSD (all): {psd_q:.3f}"]
                     if nk_enabled and nk_q is not None:
                         score_parts.append(f"NK: {nk_q:.3f}")
                         score_parts.append(
@@ -907,6 +1155,7 @@ for tab, (fname, result) in zip(tabs, all_results.items()):
                             "Window agg: "
                             f"mean={window_stats.get('mean', 0.0):.3f} | "
                             f"p25={window_stats.get('p25', 0.0):.3f} | "
+                            f"std={window_stats.get('std', 0.0):.3f} | "
                             f"coverage={window_stats.get('coverage', 0.0):.0%}"
                         )
 
@@ -932,15 +1181,29 @@ for tab, (fname, result) in zip(tabs, all_results.items()):
                             "qrs_band_amp": ("QRS Band Amplitude", "", "%.1f"),
                             "hf_noise_rms": ("HF Noise RMS", "", "%.2f"),
                             "m_a": ("Muscle Artifact Ratio", "", "%.4f"),
+                            "muscle_flag_raw": ("Raw Muscle Flag", "", "%.3f"),
                             "m_a_hf_power": ("HF Power", "", "%.4f"),
                             "m_a_broadband_hf_power": ("Broadband HF Power", "", "%.4f"),
                             "p_i": ("Powerline Interference", "", "%.4f"),
+                            "powerline_flag_raw": ("Raw Powerline Flag", "", "%.3f"),
                             "p_i_db": ("Powerline Interference", "dB", "%.1f"),
+                            "noise_artifact_flag": ("Noise Artifact", "", "%.3f"),
+                            "transient_artifact_ratio": ("Transient Artifact Ratio", "", "%.3f"),
+                            "transient_flag_raw": ("Raw Transient Flag", "", "%.3f"),
                             "periodic_artifact_ratio": ("Periodic Artifact Ratio", "", "%.4f"),
                             "periodic_artifact_freq": ("Periodic Artifact Peak", "Hz", "%.1f"),
                             "periodic_artifact_context": ("Periodic Artifact Context", "", "%.3f"),
+                            "periodic_flag_raw": ("Raw Periodic Flag", "", "%.3f"),
                             "b_d": ("Baseline Drift Ratio", "", "%.4f"),
-                            "readability_guard_support": ("Readability Guard Support", "", "%.3f"),
+                            "baseline_psd_flag_raw": ("Raw Baseline PSD Flag", "", "%.3f"),
+                            "baseline_visible_ratio": ("Visible Baseline Ratio", "", "%.3f"),
+                            "baseline_visible_flag_raw": ("Raw Visible Baseline Flag", "", "%.3f"),
+                            "readability_support": ("Readability Support", "", "%.3f"),
+                            "readability_bonus": ("Readability Bonus", "", "%.3f"),
+                            "readability_relief_gate": ("Readability Relief Gate", "", "%.3f"),
+                            "readability_relief_bonus": ("Readability Relief Bonus", "", "%.3f"),
+                            "window_quality": ("Window Quality Base", "", "%.3f"),
+                            "flag_quality": ("Flag Quality", "", "%.3f"),
                         }
                         for key, (label, unit, fmt) in _meas_labels.items():
                             v = vals.get(key)
@@ -977,11 +1240,19 @@ for tab, (fname, result) in zip(tabs, all_results.items()):
                             max_gap = vals.get("nk_max_gap_sec")
                             if max_gap is not None:
                                 st.caption(f"NK max gap: {max_gap:.2f} s")
+                            nk_peak_to_mad = vals.get("nk_peak_to_mad")
+                            if nk_peak_to_mad is not None:
+                                st.caption(f"NK peak/background ratio: {nk_peak_to_mad:.2f}")
+                            nk_morph_p25 = vals.get("nk_morph_p25_corr")
+                            if nk_morph_p25 is not None:
+                                st.caption(f"NK morphology p25 corr: {nk_morph_p25:.3f}")
+                            nk_morph_support = vals.get("nk_morph_support")
+                            if nk_morph_support is not None:
+                                st.caption(f"NK morphology support: {nk_morph_support:.3f}")
 
             # Preset & window info
             st.caption(
                 f"Preset: {q.get('preset', 'N/A')} | "
-                f"Best windows: {q.get('best_window_start', 0)}-{q.get('best_window_end', 0)} | "
                 f"Analysis start: {q.get('analysis_start_sec', 0.0):.1f}s | "
                 f"Window: {q.get('window_length_sec', 5.0):.1f}s / "
                 f"step {q.get('window_step_sec', 1.0):.1f}s | "
@@ -1016,16 +1287,6 @@ for tab, (fname, result) in zip(tabs, all_results.items()):
                         mode="lines+markers",
                         line=dict(color="white", width=2),
                     )
-                )
-                # Highlight best windows
-                best_s = q.get("best_window_start", 0)
-                best_e = q.get("best_window_end", 0)
-                win_fig.add_vrect(
-                    x0=best_s - 0.5,
-                    x1=best_e - 0.5,
-                    fillcolor="green",
-                    opacity=0.15,
-                    annotation_text="Best",
                 )
                 win_fig.update_layout(
                     title=(

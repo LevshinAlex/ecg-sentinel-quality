@@ -23,6 +23,23 @@
     "method": "averageQRS",
     "weight": 0.20
   },
+  "baseline_visibility": {
+    "enabled": true,
+    "chunk_sec": 0.4,
+    "good_ratio": 0.06,
+    "bad_ratio": 0.25
+  },
+  "readability_relief": {
+    "enabled": true,
+    "support_threshold": 0.45,
+    "support_full": 0.75,
+    "morph_threshold": 0.70,
+    "morph_full": 0.90,
+    "noise_reference": 0.55,
+    "low_snr_reference": 0.85,
+    "max_bonus": 0.0,
+    "legacy_max_bonus": 0.0
+  },
   "grade_thresholds": {
     "good": 0.90,
     "questionable": 0.70

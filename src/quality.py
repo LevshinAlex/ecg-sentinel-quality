@@ -50,23 +50,17 @@ HOLTER_THRESHOLDS: Dict[str, Tuple[float, float]] = {
 }
 
 FLAGS_WEIGHTS: Dict[str, float] = {
-    "Muscle_Artifact": 0.2,
-    "Bad_Electrode_Contact": 0.25,
-    "Powerline_Interference": 0.10,
-    "Periodic_Artifact": 0.15,
-    "Baseline_Drift": 0.15,
-    "Low_SNR": 0.15,
-    "NK_Peak_Consistency": 0.10,
+    "Noise_Artifact": 0.35,
+    "Bad_Electrode_Contact": 0.15,
+    "Baseline_Drift": 0.10,
+    "Low_SNR": 0.40,
 }
 
 FLAG_MESSAGES: Dict[str, str] = {
-    "Muscle_Artifact": "Excess muscle noise",
+    "Noise_Artifact": "Residual noise / interference",
     "Bad_Electrode_Contact": "Poor electrode contact",
-    "Powerline_Interference": "Power-line interference detected",
-    "Periodic_Artifact": "Periodic narrowband artifact detected",
     "Baseline_Drift": "Baseline drift present",
     "Low_SNR": "Low signal-to-noise ratio",
-    "NK_Peak_Consistency": "NK peak sequence inconsistent",
 }
 
 _FALLBACK_CONFIG: Dict[str, Any] = {
@@ -76,36 +70,31 @@ _FALLBACK_CONFIG: Dict[str, Any] = {
     "neurokit": {"enabled": False, "method": "averageQRS", "weight": 0.0},
     "grade_thresholds": {"good": 0.85, "questionable": 0.65},
     "window": {"length_sec": 5.0, "step_sec": 1.0, "ignore_initial_sec": 3.0},
+    "baseline_visibility": {
+        "enabled": True,
+        "chunk_sec": 0.40,
+        "good_ratio": 0.06,
+        "bad_ratio": 0.25,
+    },
+    "readability_relief": {
+        "enabled": True,
+        "support_threshold": 0.45,
+        "support_full": 0.75,
+        "morph_threshold": 0.70,
+        "morph_full": 0.90,
+        "noise_reference": 0.55,
+        "low_snr_reference": 0.85,
+        "max_bonus": 0.18,
+        "legacy_max_bonus": 0.0,
+    },
     "lead_aggregation": {
         "readable_threshold": 0.65,
-        "mean_weight": 0.55,
-        "p25_weight": 0.25,
-        "coverage_weight": 0.20,
-    },
-    "score_model": {
-        "sum_weight": 0.60,
-        "worst_weight": 0.40,
-        "worst_coefficients": {
-            "Bad_Electrode_Contact": 0.90,
-            "Low_SNR": 0.90,
-            "Periodic_Artifact": 0.80,
-            "NK_Peak_Consistency": 0.70,
-            "Muscle_Artifact": 0.55,
-            "Baseline_Drift": 0.45,
-            "Powerline_Interference": 0.40,
-        },
-        "interaction_terms": {
-            "Low_SNR|NK_Peak_Consistency": 0.12,
-            "Bad_Electrode_Contact|Low_SNR": 0.10,
-            "Periodic_Artifact|Powerline_Interference": 0.08,
-            "Muscle_Artifact|Periodic_Artifact": 0.06,
-        },
-        "hard_caps": {
-            "Bad_Electrode_Contact>=0.90": 0.25,
-            "Low_SNR>=0.90": 0.25,
-            "Periodic_Artifact>=0.90&Low_SNR>=0.70": 0.15,
-            "NK_Peak_Consistency>=0.90&Low_SNR>=0.70": 0.15,
-        },
+        "mean_weight": 0.60,
+        "p25_weight": 0.40,
+        "low_gain_bonus": 0.30,
+        "low_gain_max_base": 0.45,
+        "low_gain_max_std": 0.08,
+        "low_gain_min_support": 0.45,
     },
 }
 
@@ -223,6 +212,7 @@ def analyze_lead_quality(
     signal: np.ndarray,
     sampling_rate: int = 200,
     thresholds: Optional[Dict[str, Tuple[float, float]]] = None,
+    config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Compute signal-quality metrics for a single filtered ECG segment.
@@ -250,7 +240,7 @@ def analyze_lead_quality(
     ecg_power = np.sum(psd2[ecg_bins])
     mains_db = float(10 * np.log10((mains_power + 1e-12) / (ecg_power + 1e-12)))
     pi = _map_powerline_db_to_unit(mains_db)
-    flags["Powerline_Interference"] = pi
+    powerline_flag = pi
 
     # Periodic narrowband artifact: strong, concentrated peaks in an artifact-heavy
     # high-frequency band. We intentionally start above ~30 Hz to avoid punishing
@@ -278,7 +268,7 @@ def analyze_lead_quality(
     hf_power = np.sum(psd2[hf_bins])
     hf_broadband_power = max(0.0, float(hf_power - min(local_peak_power, hf_power)))
     ma_ratio = hf_broadband_power / total_power2
-    flags["Muscle_Artifact"] = float(
+    muscle_flag = float(
         np.clip(
             (ma_ratio - t_grades["Muscle_Artifact"][0])
             / (t_grades["Muscle_Artifact"][1] - t_grades["Muscle_Artifact"][0]),
@@ -287,10 +277,10 @@ def analyze_lead_quality(
         )
     )
 
-    # Baseline drift (<0.5 Hz)
+    # Baseline drift (<0.5 Hz) from residual LF power after preprocessing.
     lf = np.sum(psd[freqs < 0.5])
     bd = lf / total_power
-    flags["Baseline_Drift"] = float(
+    baseline_psd_flag = float(
         np.clip(
             (bd - t_grades["Baseline_Drift"][0])
             / (t_grades["Baseline_Drift"][1] - t_grades["Baseline_Drift"][0]),
@@ -298,6 +288,40 @@ def analyze_lead_quality(
             1,
         )
     )
+    # Visible baseline wander: even after HP filtering, the user may still see
+    # the baseline moving up/down inside the display window. A robust way to
+    # capture this is to compare short-segment medians across the window.
+    baseline_vis_cfg = normalize_quality_config(config).get("baseline_visibility", {})
+    visible_chunk_sec = float(baseline_vis_cfg.get("chunk_sec", 0.40))
+    visible_good_ratio = float(baseline_vis_cfg.get("good_ratio", 0.06))
+    visible_bad_ratio = float(baseline_vis_cfg.get("bad_ratio", 0.25))
+    visible_chunk = max(1, int(round(visible_chunk_sec * sampling_rate)))
+    visible_ratio = 0.0
+    if bool(baseline_vis_cfg.get("enabled", True)) and len(sig) >= visible_chunk * 4:
+        medians = np.asarray(
+            [
+                float(np.median(sig[i : i + visible_chunk]))
+                for i in range(0, len(sig) - visible_chunk + 1, visible_chunk)
+            ],
+            dtype=float,
+        )
+        if medians.size >= 4:
+            visible_ratio = float(
+                (np.percentile(medians, 95) - np.percentile(medians, 5))
+                / (float(np.ptp(sig)) + 1e-12)
+            )
+    baseline_visible_flag = float(
+        np.clip(
+            (visible_ratio - visible_good_ratio)
+            / (visible_bad_ratio - visible_good_ratio + 1e-12),
+            0.0,
+            1.0,
+        )
+    )
+    # Final baseline drift uses the stronger of:
+    # 1) residual low-frequency power
+    # 2) visible baseline movement on the displayed signal
+    flags["Baseline_Drift"] = max(baseline_psd_flag, baseline_visible_flag)
 
     # QRS amplitude
     amp = float(np.ptp(sig))
@@ -347,25 +371,43 @@ def analyze_lead_quality(
             1,
         )
     )
-    periodic_context = max(
-        flags.get("Muscle_Artifact", 0.0),
-        flags.get("Powerline_Interference", 0.0),
+    periodic_context = max(muscle_flag, powerline_flag)
+    periodic_flag = float(periodic_raw * periodic_context)
+    abs_diff = np.abs(np.diff(sig, prepend=sig[0]))
+    diff_p95 = float(np.percentile(abs_diff, 95))
+    diff_max = float(np.max(abs_diff))
+    transient_ratio = diff_max / (diff_p95 + 1e-12)
+    transient_flag = float(np.clip((transient_ratio - 3.0) / 2.0, 0.0, 1.0))
+    # Keep transient spikes as a diagnostic metric only. In filtered ECG,
+    # sharp physiological QRS slopes can look like "spikes" in the derivative
+    # domain, so using transient_flag directly in the final noise score tends
+    # to punish clean recordings.
+    flags["Noise_Artifact"] = float(
+        max(muscle_flag, powerline_flag, periodic_flag)
     )
-    flags["Periodic_Artifact"] = float(periodic_raw * periodic_context)
 
     return {
         "flags": flags,
         "values": {
             "m_a": ma_ratio,
+            "muscle_flag_raw": muscle_flag,
             "m_a_hf_power": float(hf_power),
             "m_a_broadband_hf_power": hf_broadband_power,
             "b_e_c": amp,
             "p_i": pi,
+            "powerline_flag_raw": powerline_flag,
             "p_i_db": mains_db,
+            "noise_artifact_flag": flags["Noise_Artifact"],
+            "transient_artifact_ratio": transient_ratio,
+            "transient_flag_raw": transient_flag,
             "periodic_artifact_ratio": periodic_ratio,
             "periodic_artifact_freq": periodic_freq,
             "periodic_artifact_context": periodic_context,
+            "periodic_flag_raw": periodic_flag,
             "b_d": bd,
+            "baseline_psd_flag_raw": baseline_psd_flag,
+            "baseline_visible_ratio": visible_ratio,
+            "baseline_visible_flag_raw": baseline_visible_flag,
             "snr": snr,
             "qrs_amp": amp,
             "qrs_band_amp": qrs_amp,
@@ -379,96 +421,26 @@ def compute_quality_score(
     nk_quality: Optional[float] = None,
     config: Optional[Dict[str, Any]] = None,
 ) -> float:
-    """Derive quality score (0.0-1.0) from flag severities using a hybrid model.
-
-    The score combines:
-    - weighted average penalty across all flags,
-    - strongest single-flag penalty,
-    - pairwise penalties for risky flag combinations,
-    - hard caps for catastrophic cases.
-    """
+    """Derive a simple 0..1 window score from the main readability penalties."""
     cfg = normalize_quality_config(config)
     weights = cfg.get("flags_weights", FLAGS_WEIGHTS)
-    score_model = cfg.get("score_model", {})
-
-    # Normalize only the configured positive weights to keep the sum penalty stable.
     positive_weights = {
         flag: max(0.0, float(weight))
         for flag, weight in weights.items()
         if float(weight) > 0.0
     }
     weight_sum = sum(positive_weights.values()) or 1.0
-    norm_weights = {
-        flag: value / weight_sum
-        for flag, value in positive_weights.items()
-    }
+    norm_weights = {flag: value / weight_sum for flag, value in positive_weights.items()}
 
     clamped_flags = {
         flag: float(np.clip(value, 0.0, 1.0))
         for flag, value in flags.items()
     }
 
-    penalty_sum = 0.0
+    penalty = 0.0
     for flag, value in clamped_flags.items():
-        penalty_sum += norm_weights.get(flag, 0.0) * value
-
-    worst_coeffs = score_model.get("worst_coefficients", {})
-    penalty_worst = 0.0
-    for flag, value in clamped_flags.items():
-        coeff = float(worst_coeffs.get(flag, 0.50))
-        penalty_worst = max(penalty_worst, coeff * value)
-
-    interaction_terms = score_model.get("interaction_terms", {})
-    penalty_interactions = 0.0
-    for pair_key, coeff in interaction_terms.items():
-        try:
-            left_flag, right_flag = pair_key.split("|", 1)
-        except ValueError:
-            continue
-        left = clamped_flags.get(left_flag, 0.0)
-        right = clamped_flags.get(right_flag, 0.0)
-        if left > 0.0 and right > 0.0:
-            penalty_interactions += float(coeff) * float(np.sqrt(left * right))
-
-    sum_weight = float(score_model.get("sum_weight", 0.60))
-    worst_weight = float(score_model.get("worst_weight", 0.40))
-    psd_score = 1.0 - (
-        sum_weight * penalty_sum
-        + worst_weight * penalty_worst
-        + penalty_interactions
-    )
-
-    hard_caps = score_model.get("hard_caps", {})
-    if clamped_flags.get("Bad_Electrode_Contact", 0.0) >= 0.90:
-        psd_score = min(psd_score, float(hard_caps.get("Bad_Electrode_Contact>=0.90", 0.25)))
-    if clamped_flags.get("Low_SNR", 0.0) >= 0.90:
-        psd_score = min(psd_score, float(hard_caps.get("Low_SNR>=0.90", 0.25)))
-    if (
-        clamped_flags.get("Periodic_Artifact", 0.0) >= 0.90
-        and clamped_flags.get("Low_SNR", 0.0) >= 0.70
-    ):
-        psd_score = min(
-            psd_score,
-            float(hard_caps.get("Periodic_Artifact>=0.90&Low_SNR>=0.70", 0.15)),
-        )
-    if (
-        clamped_flags.get("NK_Peak_Consistency", 0.0) >= 0.90
-        and clamped_flags.get("Low_SNR", 0.0) >= 0.70
-    ):
-        psd_score = min(
-            psd_score,
-            float(hard_caps.get("NK_Peak_Consistency>=0.90&Low_SNR>=0.70", 0.15)),
-        )
-
-    psd_score = max(0.0, min(1.0, psd_score))
-
-    if nk_quality is not None and cfg.get("neurokit", {}).get("enabled", False):
-        nk_weight = cfg["neurokit"]["weight"]
-        score = psd_score * (1.0 - nk_weight) + nk_quality * nk_weight
-    else:
-        score = psd_score
-
-    return max(0.0, min(1.0, score))
+        penalty += norm_weights.get(flag, 0.0) * value
+    return max(0.0, min(1.0, 1.0 - penalty))
 
 
 def _map_powerline_db_to_unit(mains_db: float) -> float:
@@ -522,86 +494,90 @@ def _aggregate_lead_windows(
     mean_score = float(np.mean(scores))
     median_score = float(np.median(scores))
     p25_score = float(np.percentile(scores, 25))
+    std_score = float(np.std(scores))
     coverage = float(np.mean(scores >= readable_threshold))
 
     raw_weights = {
-        "mean": max(0.0, float(agg_cfg.get("mean_weight", 0.55))),
-        "p25": max(0.0, float(agg_cfg.get("p25_weight", 0.25))),
-        "coverage": max(0.0, float(agg_cfg.get("coverage_weight", 0.20))),
+        "mean": max(0.0, float(agg_cfg.get("mean_weight", 0.60))),
+        "p25": max(0.0, float(agg_cfg.get("p25_weight", 0.40))),
     }
     weight_sum = sum(raw_weights.values()) or 1.0
     final_score = (
         mean_score * raw_weights["mean"]
         + p25_score * raw_weights["p25"]
-        + coverage * raw_weights["coverage"]
     ) / weight_sum
 
     return max(0.0, min(1.0, float(final_score))), {
         "mean": mean_score,
         "median": median_score,
         "p25": p25_score,
+        "std": std_score,
         "coverage": coverage,
     }
 
 
-def _apply_readability_guard(
-    flags: Dict[str, float],
-    values: Dict[str, float],
+def _compute_readability_support(
+    peak_info: Dict[str, float],
     nk_quality: Optional[float],
-) -> Tuple[Dict[str, float], Dict[str, float]]:
-    """Soften false penalties on readable low-gain leads with stable NK peaks.
+    snr_db: float,
+) -> float:
+    """Estimate whether the lead stays readable over the full fragment."""
+    peak_consistency = float(peak_info.get("consistency_severity", 1.0))
+    peak_span_ratio = float(peak_info.get("peak_span_ratio", 0.0))
+    peak_density_bpm = float(peak_info.get("peak_density_bpm", 0.0))
+    peak_count = float(peak_info.get("peak_count", 0.0))
 
-    We only apply the guard when several independent signs agree that the lead is
-    readable across the full fragment: low NK inconsistency, good peak coverage,
-    plausible peak density, and no electrode-contact failure.
-    """
-    adjusted = {flag: float(np.clip(value, 0.0, 1.0)) for flag, value in flags.items()}
-    enriched = dict(values)
-
-    nk_consistency = adjusted.get("NK_Peak_Consistency", 1.0)
-    bad_contact = adjusted.get("Bad_Electrode_Contact", 1.0)
-    peak_span_ratio = float(enriched.get("nk_peak_span_ratio", 0.0))
-    peak_density_bpm = float(enriched.get("nk_peak_density_bpm", 0.0))
-    peak_count = float(enriched.get("nk_r_peaks_count", 0.0))
-
-    consistency_gate = float(np.clip((0.15 - nk_consistency) / 0.15, 0.0, 1.0))
-    contact_gate = float(np.clip((0.10 - bad_contact) / 0.10, 0.0, 1.0))
-    span_gate = float(np.clip((peak_span_ratio - 0.75) / 0.20, 0.0, 1.0))
+    consistency_gate = float(np.clip((0.20 - peak_consistency) / 0.20, 0.0, 1.0))
+    span_gate = float(np.clip((peak_span_ratio - 0.85) / 0.10, 0.0, 1.0))
     density_low_gate = float(np.clip((peak_density_bpm - 25.0) / 15.0, 0.0, 1.0))
-    density_high_gate = float(np.clip((180.0 - peak_density_bpm) / 60.0, 0.0, 1.0))
+    density_high_gate = float(np.clip((150.0 - peak_density_bpm) / 40.0, 0.0, 1.0))
     density_gate = min(density_low_gate, density_high_gate)
     nk_quality_gate = (
         1.0
         if nk_quality is None
         else float(np.clip((nk_quality - 0.45) / 0.25, 0.0, 1.0))
     )
-
-    support = 0.0
-    if peak_count >= 8 and consistency_gate > 0.0 and contact_gate > 0.0:
-        support = float(
-            np.clip(
-                0.35 * consistency_gate
-                + 0.25 * contact_gate
-                + 0.20 * span_gate
-                + 0.10 * density_gate
-                + 0.10 * nk_quality_gate,
-                0.0,
-                1.0,
-            )
+    if peak_count < 8:
+        return 0.0
+    snr_gate = float(np.clip((snr_db - 4.0) / 6.0, 0.0, 1.0))
+    return float(
+        np.clip(
+            0.50 * consistency_gate
+            + 0.30 * span_gate
+            + 0.20 * density_gate,
+            0.0,
+            1.0,
         )
-        if max(span_gate, density_gate) <= 0.0:
-            support = 0.0
+        * nk_quality_gate
+        * snr_gate
+    )
 
-    if support > 0.0:
-        adjusted["Low_SNR"] *= 1.0 - 0.70 * support
-        adjusted["Muscle_Artifact"] *= 1.0 - 0.45 * support
-        if adjusted.get("Powerline_Interference", 0.0) < 0.20:
-            adjusted["Periodic_Artifact"] *= 1.0 - 0.80 * support
-        else:
-            adjusted["Periodic_Artifact"] *= 1.0 - 0.35 * support
 
-    enriched["readability_guard_support"] = support
-    return adjusted, enriched
+def _compute_peak_unreliability(values: Dict[str, float]) -> float:
+    """Simple NK-only penalty for leads whose detected peaks do not cover the record well."""
+    consistency = float(values.get("peak_consistency_proxy", 1.0))
+    span = float(values.get("nk_peak_span_ratio", 0.0))
+    long_gap_ratio = float(values.get("nk_long_gap_ratio", 1.0))
+    max_gap_sec = float(values.get("nk_max_gap_sec", 0.0))
+    morphology = float(values.get("nk_morph_unreliability", 0.0))
+
+    span_penalty = float(np.clip((0.85 - span) / 0.25, 0.0, 1.0))
+    long_gap_penalty = float(np.clip(long_gap_ratio / 0.15, 0.0, 1.0))
+    max_gap_penalty = float(np.clip((max_gap_sec - 3.5) / 3.0, 0.0, 1.0))
+
+    return float(
+        np.clip(
+            max(
+                consistency,
+                0.80 * span_penalty,
+                0.60 * long_gap_penalty,
+                0.80 * max_gap_penalty,
+                morphology,
+            ),
+            0.0,
+            1.0,
+        )
+    )
 
 
 def _compute_nk_peak_consistency(
@@ -712,6 +688,122 @@ def _compute_nk_peak_consistency(
     }
 
 
+def _compute_peak_morphology_unreliability(
+    signal: np.ndarray,
+    rpeak_positions: np.ndarray,
+    sampling_rate: int,
+) -> Dict[str, float]:
+    """Penalize leads where NK peaks do not form a repeatable ECG-like morphology."""
+    sig = np.asarray(signal, dtype=float)
+    peaks = np.asarray(rpeak_positions, dtype=np.int32)
+    if sig.size == 0 or peaks.size < 4:
+        return {
+            "peak_to_mad": 0.0,
+            "median_peak_abs": 0.0,
+            "p25_corr": 0.0,
+            "median_corr": 0.0,
+            "support": 0.0,
+            "unreliability": 1.0,
+        }
+
+    valid_peaks = peaks[(peaks >= 0) & (peaks < sig.size)]
+    if valid_peaks.size < 4:
+        return {
+            "peak_to_mad": 0.0,
+            "median_peak_abs": 0.0,
+            "p25_corr": 0.0,
+            "median_corr": 0.0,
+            "support": 0.0,
+            "unreliability": 1.0,
+        }
+
+    signal_median = float(np.median(sig))
+    signal_mad = float(np.median(np.abs(sig - signal_median))) + 1e-12
+    peak_abs = np.abs(sig[valid_peaks])
+    median_peak_abs = float(np.median(peak_abs)) if peak_abs.size else 0.0
+    peak_to_mad = median_peak_abs / signal_mad
+
+    pre = max(1, int(round(0.10 * sampling_rate)))
+    post = max(2, int(round(0.16 * sampling_rate)))
+    beats = []
+    for peak in valid_peaks:
+        start = int(peak) - pre
+        end = int(peak) + post
+        if start < 0 or end >= sig.size:
+            continue
+        beat = sig[start:end].astype(float, copy=False)
+        beat = beat - np.mean(beat)
+        beat_rms = float(np.sqrt(np.mean(beat**2)))
+        if beat_rms < 1e-9:
+            continue
+        beats.append(beat / beat_rms)
+
+    if len(beats) < 4:
+        return {
+            "peak_to_mad": peak_to_mad,
+            "median_peak_abs": median_peak_abs,
+            "p25_corr": 0.0,
+            "median_corr": 0.0,
+            "support": 0.0,
+            "unreliability": 1.0,
+        }
+
+    beat_matrix = np.vstack(beats)
+    template = np.median(beat_matrix, axis=0)
+    template = template - np.mean(template)
+    template_rms = float(np.sqrt(np.mean(template**2)))
+    if template_rms < 1e-9:
+        return {
+            "peak_to_mad": peak_to_mad,
+            "median_peak_abs": median_peak_abs,
+            "p25_corr": 0.0,
+            "median_corr": 0.0,
+            "support": 0.0,
+            "unreliability": 1.0,
+        }
+    template = template / template_rms
+
+    correlations = []
+    for beat in beat_matrix:
+        corr = float(np.corrcoef(beat, template)[0, 1])
+        if np.isfinite(corr):
+            correlations.append(corr)
+
+    if len(correlations) < 4:
+        return {
+            "peak_to_mad": peak_to_mad,
+            "median_peak_abs": median_peak_abs,
+            "p25_corr": 0.0,
+            "median_corr": 0.0,
+            "support": 0.0,
+            "unreliability": 1.0,
+        }
+
+    corr_arr = np.asarray(correlations, dtype=float)
+    p25_corr = float(np.percentile(corr_arr, 25))
+    median_corr = float(np.median(corr_arr))
+    corr_gate = float(np.clip((p25_corr - 0.60) / 0.25, 0.0, 1.0))
+    prominence_gate = float(np.clip((peak_to_mad - 3.0) / 1.5, 0.0, 1.0))
+    support = float(min(corr_gate, prominence_gate))
+    unreliability = float(np.clip((0.55 - support) / 0.35, 0.0, 1.0))
+
+    return {
+        "peak_to_mad": peak_to_mad,
+        "median_peak_abs": median_peak_abs,
+        "p25_corr": p25_corr,
+        "median_corr": median_corr,
+        "support": support,
+        "unreliability": unreliability,
+    }
+
+
+def _scaled_gate(value: float, start: float, full: float) -> float:
+    """Map a metric to 0..1 between two control points."""
+    if full <= start:
+        return float(value >= full)
+    return float(np.clip((value - start) / (full - start), 0.0, 1.0))
+
+
 def analyze_holter_quality(
     lead1: np.ndarray,
     lead2: np.ndarray,
@@ -730,9 +822,8 @@ def analyze_holter_quality(
     NeuroKit2 quality runs on the full signal and blends with PSD at the end.
     Uses best-lead selection (max) instead of weighted average.
 
-    markers1/markers2: optional QRS marker arrays from detect_qrs() (Nx2, col0=pos, col1=type).
-    They are kept for compatibility/debugging, but final quality no longer compares
-    C# markers against NeuroKit peaks.
+    markers1/markers2 are ignored and kept only for call-site compatibility.
+    Peak-based quality logic now relies only on NeuroKit detections.
 
     When `config` is provided, uses it directly instead of loading from file.
     When `config` is None, falls back to `load_quality_config(preset)`.
@@ -765,14 +856,18 @@ def analyze_holter_quality(
     if nwin == 0:
         _empty_values = {
             "m_a": 0.0,
+            "muscle_flag_raw": 0.0,
             "m_a_hf_power": 0.0,
             "m_a_broadband_hf_power": 0.0,
             "b_e_c": 0.0,
             "p_i": 0.0,
+            "powerline_flag_raw": 0.0,
             "p_i_db": -30.0,
+            "noise_artifact_flag": 0.0,
             "periodic_artifact_ratio": 0.0,
             "periodic_artifact_freq": 0.0,
             "periodic_artifact_context": 0.0,
+            "periodic_flag_raw": 0.0,
             "b_d": 0.0,
             "snr": 0.0,
             "qrs_amp": 0.0,
@@ -787,7 +882,11 @@ def analyze_holter_quality(
             "nk_peak_span_ratio": 0.0,
             "nk_long_gap_ratio": 0.0,
             "nk_max_gap_sec": 0.0,
-            "readability_guard_support": 0.0,
+            "peak_consistency_proxy": 1.0,
+            "peak_consistency_count": 0.0,
+            "readability_support": 0.0,
+            "readability_bonus": 0.0,
+            "window_quality": 0.0,
         }
         return {
             "lead1_quality": 0.0,
@@ -831,8 +930,18 @@ def analyze_holter_quality(
         seg1 = lead1[start:end]
         seg2 = lead2[start:end]
 
-        m1 = analyze_lead_quality(seg1, sampling_rate, thresholds=config["thresholds"])
-        m2 = analyze_lead_quality(seg2, sampling_rate, thresholds=config["thresholds"])
+        m1 = analyze_lead_quality(
+            seg1,
+            sampling_rate,
+            thresholds=config["thresholds"],
+            config=config,
+        )
+        m2 = analyze_lead_quality(
+            seg2,
+            sampling_rate,
+            thresholds=config["thresholds"],
+            config=config,
+        )
 
         q1 = compute_quality_score(m1["flags"], config=config)
         q2 = compute_quality_score(m2["flags"], config=config)
@@ -878,8 +987,6 @@ def analyze_holter_quality(
     agg_flags1 = {}
     agg_flags2 = {}
     for flag in FLAG_MESSAGES:
-        if flag == "NK_Peak_Consistency":
-            continue  # computed separately below
         vals1 = [w["lead1_flags"].get(flag, 0) for w in window_results]
         vals2 = [w["lead2_flags"].get(flag, 0) for w in window_results]
         agg_flags1[flag] = float(np.mean(vals1))
@@ -888,15 +995,24 @@ def analyze_holter_quality(
     # Aggregate raw measurement values from ALL windows
     _value_keys = [
         "m_a",
+        "muscle_flag_raw",
         "m_a_hf_power",
         "m_a_broadband_hf_power",
         "b_e_c",
         "p_i",
+        "powerline_flag_raw",
         "p_i_db",
+        "noise_artifact_flag",
+        "transient_artifact_ratio",
+        "transient_flag_raw",
         "periodic_artifact_ratio",
         "periodic_artifact_freq",
         "periodic_artifact_context",
+        "periodic_flag_raw",
         "b_d",
+        "baseline_psd_flag_raw",
+        "baseline_visible_ratio",
+        "baseline_visible_flag_raw",
         "snr",
         "qrs_amp",
         "qrs_band_amp",
@@ -908,7 +1024,8 @@ def analyze_holter_quality(
         lead1_values_agg[key] = float(np.mean([w["lead1_values"][key] for w in window_results]))
         lead2_values_agg[key] = float(np.mean([w["lead2_values"][key] for w in window_results]))
 
-    # NeuroKit2 quality on full signals (not windowed)
+    # NeuroKit2 detections on full signals (always used for peak logic).
+    # Whole-signal quality is computed only when enabled in config.
     nk_cfg = config.get("neurokit", {})
     lead1_nk_quality = None
     lead2_nk_quality = None
@@ -916,21 +1033,22 @@ def analyze_holter_quality(
     lead2_nk_r_peaks = 0
     lead1_nk_positions = np.empty(0, dtype=np.int32)
     lead2_nk_positions = np.empty(0, dtype=np.int32)
-    if nk_cfg.get("enabled", False):
-        nk_min_samples = sampling_rate * 4  # ecg_segment() minimum
-        for lead_sig, lead_num in [(lead1[:n], 1), (lead2[:n], 2)]:
-            if len(lead_sig) < nk_min_samples:
-                logger.debug(
-                    "Lead %d too short for NeuroKit2 (%d < %d), skipping",
-                    lead_num, len(lead_sig), nk_min_samples,
-                )
-                continue
-            try:
-                import neurokit2 as nk
+    nk_min_samples = sampling_rate * 4  # ecg_segment() minimum
+    for lead_sig, lead_num in [(lead1[:n], 1), (lead2[:n], 2)]:
+        if len(lead_sig) < nk_min_samples:
+            logger.debug(
+                "Lead %d too short for NeuroKit2 (%d < %d), skipping",
+                lead_num, len(lead_sig), nk_min_samples,
+            )
+            continue
+        try:
+            import neurokit2 as nk
 
-                cleaned = nk.ecg_clean(lead_sig, sampling_rate=sampling_rate)
-                _, peaks_info = nk.ecg_peaks(cleaned, sampling_rate=sampling_rate)
-                r_peaks = list(peaks_info.get("ECG_R_Peaks", []))
+            cleaned = nk.ecg_clean(lead_sig, sampling_rate=sampling_rate)
+            _, peaks_info = nk.ecg_peaks(cleaned, sampling_rate=sampling_rate)
+            r_peaks = list(peaks_info.get("ECG_R_Peaks", []))
+            nk_q = None
+            if nk_cfg.get("enabled", False):
                 quality_arr = nk.ecg_quality(
                     cleaned,
                     rpeaks=peaks_info.get("ECG_R_Peaks"),
@@ -941,22 +1059,18 @@ def analyze_holter_quality(
                 nk_q = float(np.clip(np.nanmean(quality_arr), 0.0, 1.0))
                 if not np.isfinite(nk_q):
                     raise ValueError("NeuroKit quality is NaN/Inf")
-                if lead_num == 1:
-                    lead1_nk_quality = nk_q
-                    lead1_nk_r_peaks = len(r_peaks)
-                    lead1_nk_positions = np.asarray(r_peaks, dtype=np.int32)
-                else:
-                    lead2_nk_quality = nk_q
-                    lead2_nk_r_peaks = len(r_peaks)
-                    lead2_nk_positions = np.asarray(r_peaks, dtype=np.int32)
-            except Exception as exc:
-                logger.warning("NeuroKit2 quality computation failed for lead %d: %s", lead_num, exc)
+            if lead_num == 1:
+                lead1_nk_quality = nk_q
+                lead1_nk_r_peaks = len(r_peaks)
+                lead1_nk_positions = np.asarray(r_peaks, dtype=np.int32)
+            else:
+                lead2_nk_quality = nk_q
+                lead2_nk_r_peaks = len(r_peaks)
+                lead2_nk_positions = np.asarray(r_peaks, dtype=np.int32)
+        except Exception as exc:
+            logger.warning("NeuroKit2 detection/quality failed for lead %d: %s", lead_num, exc)
 
     # NK peak consistency — use only NeuroKit peaks and RR plausibility.
-    nk_peak_weight = config.get("flags_weights", {}).get(
-        "NK_Peak_Consistency",
-        FLAGS_WEIGHTS.get("NK_Peak_Consistency", 0.10),
-    )
     lead1_values_agg["nk_rr_median_sec"] = 0.0
     lead2_values_agg["nk_rr_median_sec"] = 0.0
     lead1_values_agg["nk_rr_short_ratio"] = 0.0
@@ -971,12 +1085,34 @@ def analyze_holter_quality(
     lead2_values_agg["nk_long_gap_ratio"] = 0.0
     lead1_values_agg["nk_max_gap_sec"] = 0.0
     lead2_values_agg["nk_max_gap_sec"] = 0.0
-    lead1_values_agg["readability_guard_support"] = 0.0
-    lead2_values_agg["readability_guard_support"] = 0.0
+    lead1_values_agg["peak_consistency_proxy"] = 1.0
+    lead2_values_agg["peak_consistency_proxy"] = 1.0
+    lead1_values_agg["peak_consistency_count"] = 0.0
+    lead2_values_agg["peak_consistency_count"] = 0.0
+    lead1_values_agg["nk_peak_to_mad"] = 0.0
+    lead2_values_agg["nk_peak_to_mad"] = 0.0
+    lead1_values_agg["nk_morph_p25_corr"] = 0.0
+    lead2_values_agg["nk_morph_p25_corr"] = 0.0
+    lead1_values_agg["nk_morph_median_corr"] = 0.0
+    lead2_values_agg["nk_morph_median_corr"] = 0.0
+    lead1_values_agg["nk_morph_support"] = 0.0
+    lead2_values_agg["nk_morph_support"] = 0.0
+    lead1_values_agg["nk_morph_unreliability"] = 1.0
+    lead2_values_agg["nk_morph_unreliability"] = 1.0
+    lead1_values_agg["readability_support"] = 0.0
+    lead2_values_agg["readability_support"] = 0.0
+    lead1_values_agg["readability_bonus"] = 0.0
+    lead2_values_agg["readability_bonus"] = 0.0
+    lead1_values_agg["readability_relief_gate"] = 0.0
+    lead2_values_agg["readability_relief_gate"] = 0.0
+    lead1_values_agg["readability_relief_bonus"] = 0.0
+    lead2_values_agg["readability_relief_bonus"] = 0.0
+    lead1_values_agg["nk_zero_cap_applied"] = 0.0
+    lead2_values_agg["nk_zero_cap_applied"] = 0.0
     duration_sec = n / sampling_rate if sampling_rate > 0 else 0.0
-    for lead_nk_peaks, lead_nk_positions, lead_num in [
-        (lead1_nk_r_peaks, lead1_nk_positions, 1),
-        (lead2_nk_r_peaks, lead2_nk_positions, 2),
+    for lead_nk_positions, lead_num in [
+        (lead1_nk_positions, 1),
+        (lead2_nk_positions, 2),
     ]:
         severity, peak_info = _compute_nk_peak_consistency(
             lead_nk_positions,
@@ -991,6 +1127,28 @@ def analyze_holter_quality(
             lead1_values_agg["nk_peak_span_ratio"] = float(peak_info["peak_span_ratio"])
             lead1_values_agg["nk_long_gap_ratio"] = float(peak_info["long_gap_ratio"])
             lead1_values_agg["nk_max_gap_sec"] = float(peak_info["max_gap_sec"])
+            lead1_values_agg["peak_consistency_proxy"] = float(severity)
+            lead1_values_agg["peak_consistency_count"] = float(len(lead_nk_positions))
+            lead1_values_agg["readability_support"] = _compute_readability_support(
+                {
+                    "consistency_severity": float(severity),
+                    "peak_count": float(len(lead_nk_positions)),
+                    "peak_span_ratio": float(peak_info["peak_span_ratio"]),
+                    "peak_density_bpm": float(peak_info["peak_density_bpm"]),
+                },
+                lead1_nk_quality,
+                float(lead1_values_agg.get("snr", 0.0)),
+            )
+            morph_info = _compute_peak_morphology_unreliability(
+                lead1[:n],
+                lead_nk_positions,
+                sampling_rate,
+            )
+            lead1_values_agg["nk_peak_to_mad"] = float(morph_info["peak_to_mad"])
+            lead1_values_agg["nk_morph_p25_corr"] = float(morph_info["p25_corr"])
+            lead1_values_agg["nk_morph_median_corr"] = float(morph_info["median_corr"])
+            lead1_values_agg["nk_morph_support"] = float(morph_info["support"])
+            lead1_values_agg["nk_morph_unreliability"] = float(morph_info["unreliability"])
         else:
             lead2_values_agg["nk_rr_median_sec"] = float(peak_info["rr_median_sec"])
             lead2_values_agg["nk_rr_short_ratio"] = float(peak_info["rr_short_ratio"])
@@ -999,17 +1157,28 @@ def analyze_holter_quality(
             lead2_values_agg["nk_peak_span_ratio"] = float(peak_info["peak_span_ratio"])
             lead2_values_agg["nk_long_gap_ratio"] = float(peak_info["long_gap_ratio"])
             lead2_values_agg["nk_max_gap_sec"] = float(peak_info["max_gap_sec"])
-
-        if nk_cfg.get("enabled", False):
-            agg = agg_flags1 if lead_num == 1 else agg_flags2
-            agg["NK_Peak_Consistency"] = severity
-
-            # Apply as post-hoc penalty to the diagnostic PSD mean.
-            penalty = nk_peak_weight * severity
-            if lead_num == 1:
-                q1_psd_all = max(0.0, q1_psd_all - penalty)
-            else:
-                q2_psd_all = max(0.0, q2_psd_all - penalty)
+            lead2_values_agg["peak_consistency_proxy"] = float(severity)
+            lead2_values_agg["peak_consistency_count"] = float(len(lead_nk_positions))
+            lead2_values_agg["readability_support"] = _compute_readability_support(
+                {
+                    "consistency_severity": float(severity),
+                    "peak_count": float(len(lead_nk_positions)),
+                    "peak_span_ratio": float(peak_info["peak_span_ratio"]),
+                    "peak_density_bpm": float(peak_info["peak_density_bpm"]),
+                },
+                lead2_nk_quality,
+                float(lead2_values_agg.get("snr", 0.0)),
+            )
+            morph_info = _compute_peak_morphology_unreliability(
+                lead2[:n],
+                lead_nk_positions,
+                sampling_rate,
+            )
+            lead2_values_agg["nk_peak_to_mad"] = float(morph_info["peak_to_mad"])
+            lead2_values_agg["nk_morph_p25_corr"] = float(morph_info["p25_corr"])
+            lead2_values_agg["nk_morph_median_corr"] = float(morph_info["median_corr"])
+            lead2_values_agg["nk_morph_support"] = float(morph_info["support"])
+            lead2_values_agg["nk_morph_unreliability"] = float(morph_info["unreliability"])
 
     # Aggregate per-window scores into a final readability score per lead.
     lead_agg_cfg = config.get("lead_aggregation", {})
@@ -1019,50 +1188,143 @@ def analyze_holter_quality(
     q2_score, q2_window_stats = _aggregate_lead_windows(
         window_results, "lead2_score", lead_agg_cfg
     )
-    if "NK_Peak_Consistency" in agg_flags1:
-        q1_score = max(0.0, q1_score - nk_peak_weight * agg_flags1["NK_Peak_Consistency"])
-    if "NK_Peak_Consistency" in agg_flags2:
-        q2_score = max(0.0, q2_score - nk_peak_weight * agg_flags2["NK_Peak_Consistency"])
-
     # Include NK fields in aggregated values
     lead1_values_agg["nk_quality"] = lead1_nk_quality
     lead2_values_agg["nk_quality"] = lead2_nk_quality
     lead1_values_agg["nk_r_peaks_count"] = lead1_nk_r_peaks
     lead2_values_agg["nk_r_peaks_count"] = lead2_nk_r_peaks
 
-    # Guard against false low-gain penalties when NK confirms the lead is readable.
-    agg_flags1, lead1_values_agg = _apply_readability_guard(
-        agg_flags1,
-        lead1_values_agg,
-        lead1_nk_quality,
-    )
-    agg_flags2, lead2_values_agg = _apply_readability_guard(
-        agg_flags2,
-        lead2_values_agg,
-        lead2_nk_quality,
-    )
+    q1_window_score = q1_score
+    q2_window_score = q2_score
+    q1_flag_score = compute_quality_score(agg_flags1, config=config)
+    q2_flag_score = compute_quality_score(agg_flags2, config=config)
+    q1_bonus = 0.0
+    q2_bonus = 0.0
+    q1_relief_bonus = 0.0
+    q2_relief_bonus = 0.0
+    low_gain_bonus = float(lead_agg_cfg.get("low_gain_bonus", 0.20))
+    low_gain_max_base = float(lead_agg_cfg.get("low_gain_max_base", 0.45))
+    low_gain_max_std = float(lead_agg_cfg.get("low_gain_max_std", 0.08))
+    low_gain_min_support = float(lead_agg_cfg.get("low_gain_min_support", 0.80))
+    q1_peak_unreliability = _compute_peak_unreliability(lead1_values_agg)
+    q2_peak_unreliability = _compute_peak_unreliability(lead2_values_agg)
+    if (
+        lead1_values_agg["readability_support"] >= low_gain_min_support
+        and q1_window_score <= low_gain_max_base
+        and q1_window_stats.get("std", 1.0) <= low_gain_max_std
+        and agg_flags1.get("Bad_Electrode_Contact", 1.0) < 0.25
+        and q1_peak_unreliability <= 0.15
+    ):
+        q1_bonus = low_gain_bonus * float(lead1_values_agg["readability_support"])
+    if (
+        lead2_values_agg["readability_support"] >= low_gain_min_support
+        and q2_window_score <= low_gain_max_base
+        and q2_window_stats.get("std", 1.0) <= low_gain_max_std
+        and agg_flags2.get("Bad_Electrode_Contact", 1.0) < 0.25
+        and q2_peak_unreliability <= 0.15
+    ):
+        q2_bonus = low_gain_bonus * float(lead2_values_agg["readability_support"])
 
-    q1_flag_score = compute_quality_score(
-        {k: v for k, v in agg_flags1.items() if k != "NK_Peak_Consistency"},
-        config=config,
-    )
-    q2_flag_score = compute_quality_score(
-        {k: v for k, v in agg_flags2.items() if k != "NK_Peak_Consistency"},
-        config=config,
-    )
-    q1_score = max(q1_score, q1_flag_score)
-    q2_score = max(q2_score, q2_flag_score)
-    q1_psd_all = max(q1_psd_all, q1_flag_score)
-    q2_psd_all = max(q2_psd_all, q2_flag_score)
+    # Optional "readability relief" keeps low-gain but clearly readable ECG
+    # from being over-penalized by pure PSD metrics. Setting max_bonus=0.0
+    # restores the legacy behaviour for A/B testing.
+    relief_cfg = config.get("readability_relief", {})
+    if bool(relief_cfg.get("enabled", True)):
+        support_threshold = float(relief_cfg.get("support_threshold", 0.45))
+        support_full = float(relief_cfg.get("support_full", 0.75))
+        morph_threshold = float(relief_cfg.get("morph_threshold", 0.70))
+        morph_full = float(relief_cfg.get("morph_full", 0.90))
+        noise_reference = max(1e-6, float(relief_cfg.get("noise_reference", 0.55)))
+        low_snr_reference = max(1e-6, float(relief_cfg.get("low_snr_reference", 0.85)))
+        max_relief_bonus = max(0.0, float(relief_cfg.get("max_bonus", 0.0)))
 
-    # Blend aggregated lead score with NK (whole-signal) for final scores.
-    nk_weight = nk_cfg.get("weight", 0.0) if nk_cfg.get("enabled", False) else 0.0
-    q1_avg = q1_score
-    q2_avg = q2_score
-    if lead1_nk_quality is not None and nk_weight > 0:
-        q1_avg = q1_score * (1.0 - nk_weight) + lead1_nk_quality * nk_weight
-    if lead2_nk_quality is not None and nk_weight > 0:
-        q2_avg = q2_score * (1.0 - nk_weight) + lead2_nk_quality * nk_weight
+        q1_support_gate = _scaled_gate(
+            float(lead1_values_agg.get("readability_support", 0.0)),
+            support_threshold,
+            support_full,
+        )
+        q2_support_gate = _scaled_gate(
+            float(lead2_values_agg.get("readability_support", 0.0)),
+            support_threshold,
+            support_full,
+        )
+        q1_morph_gate = _scaled_gate(
+            float(lead1_values_agg.get("nk_morph_support", 0.0)),
+            morph_threshold,
+            morph_full,
+        )
+        q2_morph_gate = _scaled_gate(
+            float(lead2_values_agg.get("nk_morph_support", 0.0)),
+            morph_threshold,
+            morph_full,
+        )
+        q1_relief_gate = min(
+            q1_support_gate,
+            q1_morph_gate,
+            float(np.clip(1.0 - q1_peak_unreliability, 0.0, 1.0)),
+        )
+        q2_relief_gate = min(
+            q2_support_gate,
+            q2_morph_gate,
+            float(np.clip(1.0 - q2_peak_unreliability, 0.0, 1.0)),
+        )
+        q1_pressure = float(
+            np.clip(
+                0.5 * agg_flags1.get("Noise_Artifact", 0.0) / noise_reference
+                + 0.5 * agg_flags1.get("Low_SNR", 0.0) / low_snr_reference,
+                0.0,
+                1.0,
+            )
+        )
+        q2_pressure = float(
+            np.clip(
+                0.5 * agg_flags2.get("Noise_Artifact", 0.0) / noise_reference
+                + 0.5 * agg_flags2.get("Low_SNR", 0.0) / low_snr_reference,
+                0.0,
+                1.0,
+            )
+        )
+        if agg_flags1.get("Bad_Electrode_Contact", 1.0) < 0.25:
+            q1_relief_bonus = max_relief_bonus * q1_relief_gate * q1_pressure
+        if agg_flags2.get("Bad_Electrode_Contact", 1.0) < 0.25:
+            q2_relief_bonus = max_relief_bonus * q2_relief_gate * q2_pressure
+        lead1_values_agg["readability_relief_gate"] = q1_relief_gate
+        lead2_values_agg["readability_relief_gate"] = q2_relief_gate
+
+    if lead1_nk_r_peaks == 0:
+        q1_window_score = min(q1_window_score, 0.25)
+        q1_bonus = 0.0
+        q1_relief_bonus = 0.0
+        lead1_values_agg["nk_zero_cap_applied"] = 1.0
+    if lead2_nk_r_peaks == 0:
+        q2_window_score = min(q2_window_score, 0.25)
+        q2_bonus = 0.0
+        q2_relief_bonus = 0.0
+        lead2_values_agg["nk_zero_cap_applied"] = 1.0
+
+    lead1_values_agg["window_quality"] = q1_window_score
+    lead2_values_agg["window_quality"] = q2_window_score
+    lead1_values_agg["flag_quality"] = q1_flag_score
+    lead2_values_agg["flag_quality"] = q2_flag_score
+    lead1_values_agg["flag_uplift_limit"] = q1_bonus
+    lead2_values_agg["flag_uplift_limit"] = q2_bonus
+    lead1_values_agg["low_gain_recovery_limit"] = q1_bonus
+    lead2_values_agg["low_gain_recovery_limit"] = q2_bonus
+    lead1_values_agg["readability_bonus"] = q1_bonus
+    lead2_values_agg["readability_bonus"] = q2_bonus
+    lead1_values_agg["readability_relief_bonus"] = q1_relief_bonus
+    lead2_values_agg["readability_relief_bonus"] = q2_relief_bonus
+
+    q1_avg = max(0.0, min(1.0, q1_window_score + q1_bonus + q1_relief_bonus))
+    q2_avg = max(0.0, min(1.0, q2_window_score + q2_bonus + q2_relief_bonus))
+    q1_peak_penalty = 0.45 * q1_peak_unreliability
+    q2_peak_penalty = 0.45 * q2_peak_unreliability
+    lead1_values_agg["peak_unreliability"] = q1_peak_penalty / 0.45 if 0.45 > 0 else 0.0
+    lead2_values_agg["peak_unreliability"] = q2_peak_penalty / 0.45 if 0.45 > 0 else 0.0
+    q1_avg = max(0.0, q1_avg - q1_peak_penalty)
+    q2_avg = max(0.0, q2_avg - q2_peak_penalty)
+    q1_psd_all = q1_window_score
+    q2_psd_all = q2_window_score
     q1_avg = max(0.0, min(1.0, q1_avg))
     q2_avg = max(0.0, min(1.0, q2_avg))
     overall = max(q1_avg, q2_avg)
