@@ -37,6 +37,7 @@ _THRESH_CONFIG = {
     "Muscle_Artifact": {"min": 0.0, "max": 1.0, "step": 0.005, "format": "%.3f"},
     "Bad_Electrode_Contact": {"min": 0.0, "max": 2000.0, "step": 5.0, "format": "%.0f"},
     "Powerline_Interference": {"min": 0.0, "max": 1.0, "step": 0.005, "format": "%.3f"},
+    "Periodic_Artifact": {"min": 0.0, "max": 1.0, "step": 0.005, "format": "%.3f"},
     "Baseline_Drift": {"min": 0.0, "max": 1.0, "step": 0.01, "format": "%.2f"},
     "Low_SNR": {"min": 0.0, "max": 50.0, "step": 1.0, "format": "%.0f"},
 }
@@ -931,8 +932,15 @@ for tab, (fname, result) in zip(tabs, all_results.items()):
                             "qrs_band_amp": ("QRS Band Amplitude", "", "%.1f"),
                             "hf_noise_rms": ("HF Noise RMS", "", "%.2f"),
                             "m_a": ("Muscle Artifact Ratio", "", "%.4f"),
+                            "m_a_hf_power": ("HF Power", "", "%.4f"),
+                            "m_a_broadband_hf_power": ("Broadband HF Power", "", "%.4f"),
                             "p_i": ("Powerline Interference", "", "%.4f"),
+                            "p_i_db": ("Powerline Interference", "dB", "%.1f"),
+                            "periodic_artifact_ratio": ("Periodic Artifact Ratio", "", "%.4f"),
+                            "periodic_artifact_freq": ("Periodic Artifact Peak", "Hz", "%.1f"),
+                            "periodic_artifact_context": ("Periodic Artifact Context", "", "%.3f"),
                             "b_d": ("Baseline Drift Ratio", "", "%.4f"),
+                            "readability_guard_support": ("Readability Guard Support", "", "%.3f"),
                         }
                         for key, (label, unit, fmt) in _meas_labels.items():
                             v = vals.get(key)
@@ -974,6 +982,7 @@ for tab, (fname, result) in zip(tabs, all_results.items()):
             st.caption(
                 f"Preset: {q.get('preset', 'N/A')} | "
                 f"Best windows: {q.get('best_window_start', 0)}-{q.get('best_window_end', 0)} | "
+                f"Analysis start: {q.get('analysis_start_sec', 0.0):.1f}s | "
                 f"Window: {q.get('window_length_sec', 5.0):.1f}s / "
                 f"step {q.get('window_step_sec', 1.0):.1f}s | "
                 f"Quality best lead: {q.get('quality_best_lead', 'N/A')}"

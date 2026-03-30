@@ -1,22 +1,33 @@
 {
   "thresholds": {
-    "Muscle_Artifact": [0.045, 0.10],
-    "Bad_Electrode_Contact": [10, 800],
-    "Powerline_Interference": [0.01, 0.05],
-    "Baseline_Drift": [0.03, 0.90],
-    "Low_SNR": [22, 12]
-  },
-  "_threshold_docs": {
-    "format": "[boundary_low, boundary_high] — flag severity interpolated 0-1 between boundaries",
-    "Low_SNR": "INVERTED: [good_threshold, bad_threshold] — high SNR maps to low flag severity, low SNR maps to high severity"
+    "Muscle_Artifact": [
+      0.03,
+      0.1
+    ],
+    "Bad_Electrode_Contact": [
+      10.0,
+      800.0
+    ],
+    "Powerline_Interference": [
+      0.01,
+      0.05
+    ],
+    "Baseline_Drift": [
+      0.03,
+      0.9
+    ],
+    "Low_SNR": [
+      22.0,
+      12.0
+    ]
   },
   "flags_weights": {
-    "Muscle_Artifact": 0.2,
-    "Bad_Electrode_Contact": 0.25,
-    "Powerline_Interference": 0.15,
-    "Baseline_Drift": 0.2,
-    "Low_SNR": 0.2,
-    "QRS_Count_Mismatch": 0.10
+    "Muscle_Artifact": 0.15,
+    "Bad_Electrode_Contact": 0.2,
+    "Powerline_Interference": 0.2,
+    "Baseline_Drift": 0.15,
+    "Low_SNR": 0.15,
+    "NK_Peak_Consistency": 0.15
   },
   "neurokit": {
     "enabled": true,
@@ -26,5 +37,9 @@
   "grade_thresholds": {
     "good": 0.85,
     "questionable": 0.65
+  },
+  "_threshold_docs": {
+    "format": "[boundary_low, boundary_high] \u2014 flag severity interpolated 0-1 between boundaries",
+    "Low_SNR": "INVERTED: [good_threshold, bad_threshold] \u2014 high SNR maps to low flag severity, low SNR maps to high severity"
   }
 }

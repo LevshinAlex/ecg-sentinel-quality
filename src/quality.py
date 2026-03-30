@@ -44,6 +44,7 @@ HOLTER_THRESHOLDS: Dict[str, Tuple[float, float]] = {
     "Muscle_Artifact": (0.045, 0.10),
     "Bad_Electrode_Contact": (10, 800),
     "Powerline_Interference": (0.01, 0.05),
+    "Periodic_Artifact": (0.10, 0.45),
     "Baseline_Drift": (0.03, 0.90),
     "Low_SNR": (22, 12),
 }
@@ -51,9 +52,10 @@ HOLTER_THRESHOLDS: Dict[str, Tuple[float, float]] = {
 FLAGS_WEIGHTS: Dict[str, float] = {
     "Muscle_Artifact": 0.2,
     "Bad_Electrode_Contact": 0.25,
-    "Powerline_Interference": 0.15,
-    "Baseline_Drift": 0.2,
-    "Low_SNR": 0.2,
+    "Powerline_Interference": 0.10,
+    "Periodic_Artifact": 0.15,
+    "Baseline_Drift": 0.15,
+    "Low_SNR": 0.15,
     "NK_Peak_Consistency": 0.10,
 }
 
@@ -61,6 +63,7 @@ FLAG_MESSAGES: Dict[str, str] = {
     "Muscle_Artifact": "Excess muscle noise",
     "Bad_Electrode_Contact": "Poor electrode contact",
     "Powerline_Interference": "Power-line interference detected",
+    "Periodic_Artifact": "Periodic narrowband artifact detected",
     "Baseline_Drift": "Baseline drift present",
     "Low_SNR": "Low signal-to-noise ratio",
     "NK_Peak_Consistency": "NK peak sequence inconsistent",
@@ -72,12 +75,37 @@ _FALLBACK_CONFIG: Dict[str, Any] = {
     "flags_weights": dict(FLAGS_WEIGHTS),
     "neurokit": {"enabled": False, "method": "averageQRS", "weight": 0.0},
     "grade_thresholds": {"good": 0.85, "questionable": 0.65},
-    "window": {"length_sec": 5.0, "step_sec": 1.0},
+    "window": {"length_sec": 5.0, "step_sec": 1.0, "ignore_initial_sec": 3.0},
     "lead_aggregation": {
         "readable_threshold": 0.65,
         "mean_weight": 0.55,
         "p25_weight": 0.25,
         "coverage_weight": 0.20,
+    },
+    "score_model": {
+        "sum_weight": 0.60,
+        "worst_weight": 0.40,
+        "worst_coefficients": {
+            "Bad_Electrode_Contact": 0.90,
+            "Low_SNR": 0.90,
+            "Periodic_Artifact": 0.80,
+            "NK_Peak_Consistency": 0.70,
+            "Muscle_Artifact": 0.55,
+            "Baseline_Drift": 0.45,
+            "Powerline_Interference": 0.40,
+        },
+        "interaction_terms": {
+            "Low_SNR|NK_Peak_Consistency": 0.12,
+            "Bad_Electrode_Contact|Low_SNR": 0.10,
+            "Periodic_Artifact|Powerline_Interference": 0.08,
+            "Muscle_Artifact|Periodic_Artifact": 0.06,
+        },
+        "hard_caps": {
+            "Bad_Electrode_Contact>=0.90": 0.25,
+            "Low_SNR>=0.90": 0.25,
+            "Periodic_Artifact>=0.90&Low_SNR>=0.70": 0.15,
+            "NK_Peak_Consistency>=0.90&Low_SNR>=0.70": 0.15,
+        },
     },
 }
 
@@ -214,26 +242,42 @@ def analyze_lead_quality(
     freqs2, psd2 = welch(sig, fs=sampling_rate, nperseg=nperseg)
     total_power2 = np.sum(psd2) + 1e-12
 
-    # Powerline interference (48-52 and 58-62 Hz)
+    # Powerline interference: compare mains energy against useful ECG-band energy,
+    # then compress the result to a 0..1 perceptual scale.
     mains_bins = ((freqs2 >= 48) & (freqs2 <= 52)) | ((freqs2 >= 58) & (freqs2 <= 62))
     mains_power = np.sum(psd2[mains_bins])
-    pi = mains_power / total_power2
-    flags["Powerline_Interference"] = float(
-        np.clip(
-            (pi - t_grades["Powerline_Interference"][0])
-            / (
-                t_grades["Powerline_Interference"][1]
-                - t_grades["Powerline_Interference"][0]
-            ),
-            0,
-            1,
-        )
-    )
+    ecg_bins = (freqs2 >= 0.5) & (freqs2 <= min(40, sampling_rate / 2 - 1))
+    ecg_power = np.sum(psd2[ecg_bins])
+    mains_db = float(10 * np.log10((mains_power + 1e-12) / (ecg_power + 1e-12)))
+    pi = _map_powerline_db_to_unit(mains_db)
+    flags["Powerline_Interference"] = pi
 
-    # Muscle artifact (35-100 Hz, capped by Nyquist)
+    # Periodic narrowband artifact: strong, concentrated peaks in an artifact-heavy
+    # high-frequency band. We intentionally start above ~30 Hz to avoid punishing
+    # stable generator ECG harmonics around the upper end of the QRS band.
+    periodic_bins = (freqs2 >= 30) & (freqs2 <= min(90, sampling_rate / 2 - 1))
+    periodic_freqs = freqs2[periodic_bins]
+    periodic_psd = psd2[periodic_bins]
+    if periodic_psd.size >= 3:
+        peak_idx = int(np.argmax(periodic_psd))
+        left = max(0, peak_idx - 1)
+        right = min(periodic_psd.size, peak_idx + 2)
+        local_peak_power = float(np.sum(periodic_psd[left:right]))
+        periodic_band_power = float(np.sum(periodic_psd) + 1e-12)
+        periodic_ratio = local_peak_power / periodic_band_power
+        periodic_freq = float(periodic_freqs[peak_idx])
+    else:
+        local_peak_power = 0.0
+        periodic_ratio = 0.0
+        periodic_freq = 0.0
+
+    # Muscle artifact should emphasize broadband HF noise. If most HF energy is
+    # concentrated in one narrow line, that belongs more to Periodic_Artifact
+    # than to true EMG-like noise.
     hf_bins = (freqs2 >= 35) & (freqs2 <= min(100, sampling_rate / 2))
     hf_power = np.sum(psd2[hf_bins])
-    ma_ratio = hf_power / total_power2
+    hf_broadband_power = max(0.0, float(hf_power - min(local_peak_power, hf_power)))
+    ma_ratio = hf_broadband_power / total_power2
     flags["Muscle_Artifact"] = float(
         np.clip(
             (ma_ratio - t_grades["Muscle_Artifact"][0])
@@ -281,29 +325,46 @@ def analyze_lead_quality(
         noise_rms = float(np.sqrt(np.mean(noise_band**2)) + 1e-12)
         snr = 20 * np.log10(qrs_amp / noise_rms) if noise_rms > 0 else 60.0
 
-        if qrs_amp < 5:
-            flags["Low_SNR"] = 1.0
-        else:
-            flags["Low_SNR"] = float(
-                np.clip(
-                    (snr - t_grades["Low_SNR"][0])
-                    / (t_grades["Low_SNR"][1] - t_grades["Low_SNR"][0]),
-                    0,
-                    1,
-                )
+        flags["Low_SNR"] = float(
+            np.clip(
+                (snr - t_grades["Low_SNR"][0])
+                / (t_grades["Low_SNR"][1] - t_grades["Low_SNR"][0]),
+                0,
+                1,
             )
+        )
     except Exception:
         qrs_amp = 0.0
         noise_rms = float(np.sqrt(np.mean(sig**2)) + 1e-12)
         snr = 0.0
         flags["Low_SNR"] = 1.0
 
+    periodic_raw = float(
+        np.clip(
+            (periodic_ratio - t_grades["Periodic_Artifact"][0])
+            / (t_grades["Periodic_Artifact"][1] - t_grades["Periodic_Artifact"][0]),
+            0,
+            1,
+        )
+    )
+    periodic_context = max(
+        flags.get("Muscle_Artifact", 0.0),
+        flags.get("Powerline_Interference", 0.0),
+    )
+    flags["Periodic_Artifact"] = float(periodic_raw * periodic_context)
+
     return {
         "flags": flags,
         "values": {
             "m_a": ma_ratio,
+            "m_a_hf_power": float(hf_power),
+            "m_a_broadband_hf_power": hf_broadband_power,
             "b_e_c": amp,
             "p_i": pi,
+            "p_i_db": mains_db,
+            "periodic_artifact_ratio": periodic_ratio,
+            "periodic_artifact_freq": periodic_freq,
+            "periodic_artifact_context": periodic_context,
             "b_d": bd,
             "snr": snr,
             "qrs_amp": amp,
@@ -318,22 +379,116 @@ def compute_quality_score(
     nk_quality: Optional[float] = None,
     config: Optional[Dict[str, Any]] = None,
 ) -> float:
-    """Derive quality score (0.0-1.0) where each flag deducts weighted penalty.
-    Optionally blends with NeuroKit quality index when available."""
-    weights = config["flags_weights"] if config and "flags_weights" in config else FLAGS_WEIGHTS
-    psd_score = 1.0
-    for flag, value in flags.items():
-        if value > 0.0:
-            psd_score -= weights.get(flag, 0.2) * value
+    """Derive quality score (0.0-1.0) from flag severities using a hybrid model.
+
+    The score combines:
+    - weighted average penalty across all flags,
+    - strongest single-flag penalty,
+    - pairwise penalties for risky flag combinations,
+    - hard caps for catastrophic cases.
+    """
+    cfg = normalize_quality_config(config)
+    weights = cfg.get("flags_weights", FLAGS_WEIGHTS)
+    score_model = cfg.get("score_model", {})
+
+    # Normalize only the configured positive weights to keep the sum penalty stable.
+    positive_weights = {
+        flag: max(0.0, float(weight))
+        for flag, weight in weights.items()
+        if float(weight) > 0.0
+    }
+    weight_sum = sum(positive_weights.values()) or 1.0
+    norm_weights = {
+        flag: value / weight_sum
+        for flag, value in positive_weights.items()
+    }
+
+    clamped_flags = {
+        flag: float(np.clip(value, 0.0, 1.0))
+        for flag, value in flags.items()
+    }
+
+    penalty_sum = 0.0
+    for flag, value in clamped_flags.items():
+        penalty_sum += norm_weights.get(flag, 0.0) * value
+
+    worst_coeffs = score_model.get("worst_coefficients", {})
+    penalty_worst = 0.0
+    for flag, value in clamped_flags.items():
+        coeff = float(worst_coeffs.get(flag, 0.50))
+        penalty_worst = max(penalty_worst, coeff * value)
+
+    interaction_terms = score_model.get("interaction_terms", {})
+    penalty_interactions = 0.0
+    for pair_key, coeff in interaction_terms.items():
+        try:
+            left_flag, right_flag = pair_key.split("|", 1)
+        except ValueError:
+            continue
+        left = clamped_flags.get(left_flag, 0.0)
+        right = clamped_flags.get(right_flag, 0.0)
+        if left > 0.0 and right > 0.0:
+            penalty_interactions += float(coeff) * float(np.sqrt(left * right))
+
+    sum_weight = float(score_model.get("sum_weight", 0.60))
+    worst_weight = float(score_model.get("worst_weight", 0.40))
+    psd_score = 1.0 - (
+        sum_weight * penalty_sum
+        + worst_weight * penalty_worst
+        + penalty_interactions
+    )
+
+    hard_caps = score_model.get("hard_caps", {})
+    if clamped_flags.get("Bad_Electrode_Contact", 0.0) >= 0.90:
+        psd_score = min(psd_score, float(hard_caps.get("Bad_Electrode_Contact>=0.90", 0.25)))
+    if clamped_flags.get("Low_SNR", 0.0) >= 0.90:
+        psd_score = min(psd_score, float(hard_caps.get("Low_SNR>=0.90", 0.25)))
+    if (
+        clamped_flags.get("Periodic_Artifact", 0.0) >= 0.90
+        and clamped_flags.get("Low_SNR", 0.0) >= 0.70
+    ):
+        psd_score = min(
+            psd_score,
+            float(hard_caps.get("Periodic_Artifact>=0.90&Low_SNR>=0.70", 0.15)),
+        )
+    if (
+        clamped_flags.get("NK_Peak_Consistency", 0.0) >= 0.90
+        and clamped_flags.get("Low_SNR", 0.0) >= 0.70
+    ):
+        psd_score = min(
+            psd_score,
+            float(hard_caps.get("NK_Peak_Consistency>=0.90&Low_SNR>=0.70", 0.15)),
+        )
+
     psd_score = max(0.0, min(1.0, psd_score))
 
-    if nk_quality is not None and config and config.get("neurokit", {}).get("enabled", False):
-        nk_weight = config["neurokit"]["weight"]
+    if nk_quality is not None and cfg.get("neurokit", {}).get("enabled", False):
+        nk_weight = cfg["neurokit"]["weight"]
         score = psd_score * (1.0 - nk_weight) + nk_quality * nk_weight
     else:
         score = psd_score
 
     return max(0.0, min(1.0, score))
+
+
+def _map_powerline_db_to_unit(mains_db: float) -> float:
+    """Map mains-vs-ECG ratio in dB to a perceptual 0..1 interference score.
+
+    Anchors:
+    - <= -15 dB: 0.00 (mains almost does not matter)
+    -  -7.5 dB: 0.33 (noticeable)
+    -   0.0 dB: 0.66 (mains comparable to useful ECG energy)
+    - >= 10 dB: 1.00 (mains dominates)
+    """
+    if mains_db <= -15.0:
+        return 0.0
+    if mains_db <= -7.5:
+        return float((mains_db + 15.0) / 7.5 * 0.33)
+    if mains_db <= 0.0:
+        return float(0.33 + (mains_db + 7.5) / 7.5 * 0.33)
+    if mains_db <= 10.0:
+        return float(0.66 + mains_db / 10.0 * 0.34)
+    return 1.0
 
 
 def _iter_window_bounds(n_samples: int, wlen: int, step: int) -> list[Tuple[int, int]]:
@@ -387,6 +542,66 @@ def _aggregate_lead_windows(
         "p25": p25_score,
         "coverage": coverage,
     }
+
+
+def _apply_readability_guard(
+    flags: Dict[str, float],
+    values: Dict[str, float],
+    nk_quality: Optional[float],
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """Soften false penalties on readable low-gain leads with stable NK peaks.
+
+    We only apply the guard when several independent signs agree that the lead is
+    readable across the full fragment: low NK inconsistency, good peak coverage,
+    plausible peak density, and no electrode-contact failure.
+    """
+    adjusted = {flag: float(np.clip(value, 0.0, 1.0)) for flag, value in flags.items()}
+    enriched = dict(values)
+
+    nk_consistency = adjusted.get("NK_Peak_Consistency", 1.0)
+    bad_contact = adjusted.get("Bad_Electrode_Contact", 1.0)
+    peak_span_ratio = float(enriched.get("nk_peak_span_ratio", 0.0))
+    peak_density_bpm = float(enriched.get("nk_peak_density_bpm", 0.0))
+    peak_count = float(enriched.get("nk_r_peaks_count", 0.0))
+
+    consistency_gate = float(np.clip((0.15 - nk_consistency) / 0.15, 0.0, 1.0))
+    contact_gate = float(np.clip((0.10 - bad_contact) / 0.10, 0.0, 1.0))
+    span_gate = float(np.clip((peak_span_ratio - 0.75) / 0.20, 0.0, 1.0))
+    density_low_gate = float(np.clip((peak_density_bpm - 25.0) / 15.0, 0.0, 1.0))
+    density_high_gate = float(np.clip((180.0 - peak_density_bpm) / 60.0, 0.0, 1.0))
+    density_gate = min(density_low_gate, density_high_gate)
+    nk_quality_gate = (
+        1.0
+        if nk_quality is None
+        else float(np.clip((nk_quality - 0.45) / 0.25, 0.0, 1.0))
+    )
+
+    support = 0.0
+    if peak_count >= 8 and consistency_gate > 0.0 and contact_gate > 0.0:
+        support = float(
+            np.clip(
+                0.35 * consistency_gate
+                + 0.25 * contact_gate
+                + 0.20 * span_gate
+                + 0.10 * density_gate
+                + 0.10 * nk_quality_gate,
+                0.0,
+                1.0,
+            )
+        )
+        if max(span_gate, density_gate) <= 0.0:
+            support = 0.0
+
+    if support > 0.0:
+        adjusted["Low_SNR"] *= 1.0 - 0.70 * support
+        adjusted["Muscle_Artifact"] *= 1.0 - 0.45 * support
+        if adjusted.get("Powerline_Interference", 0.0) < 0.20:
+            adjusted["Periodic_Artifact"] *= 1.0 - 0.80 * support
+        else:
+            adjusted["Periodic_Artifact"] *= 1.0 - 0.35 * support
+
+    enriched["readability_guard_support"] = support
+    return adjusted, enriched
 
 
 def _compute_nk_peak_consistency(
@@ -531,21 +746,38 @@ def analyze_holter_quality(
     effective_step_sec = float(
         step_sec if step_sec is not None else window_cfg.get("step_sec", 1.0)
     )
+    effective_ignore_initial_sec = float(window_cfg.get("ignore_initial_sec", 3.0))
 
     wlen = int(effective_window_sec * sampling_rate)
     step = int(effective_step_sec * sampling_rate)
     n = min(len(lead1), len(lead2))
-    window_bounds = _iter_window_bounds(n, wlen, step)
+    analysis_start = int(max(0.0, effective_ignore_initial_sec) * sampling_rate)
+    if n - analysis_start < wlen:
+        analysis_start = 0
+    trimmed_n = max(0, n - analysis_start)
+    relative_bounds = _iter_window_bounds(trimmed_n, wlen, step)
+    window_bounds = [
+        (analysis_start + start, analysis_start + end)
+        for start, end in relative_bounds
+    ]
     nwin = len(window_bounds)
 
     if nwin == 0:
         _empty_values = {
             "m_a": 0.0,
+            "m_a_hf_power": 0.0,
+            "m_a_broadband_hf_power": 0.0,
             "b_e_c": 0.0,
             "p_i": 0.0,
+            "p_i_db": -30.0,
+            "periodic_artifact_ratio": 0.0,
+            "periodic_artifact_freq": 0.0,
+            "periodic_artifact_context": 0.0,
             "b_d": 0.0,
             "snr": 0.0,
             "qrs_amp": 0.0,
+            "qrs_band_amp": 0.0,
+            "hf_noise_rms": 0.0,
             "nk_quality": None,
             "nk_r_peaks_count": 0,
             "nk_rr_median_sec": 0.0,
@@ -555,6 +787,7 @@ def analyze_holter_quality(
             "nk_peak_span_ratio": 0.0,
             "nk_long_gap_ratio": 0.0,
             "nk_max_gap_sec": 0.0,
+            "readability_guard_support": 0.0,
         }
         return {
             "lead1_quality": 0.0,
@@ -589,6 +822,7 @@ def analyze_holter_quality(
             },
             "window_length_sec": effective_window_sec,
             "window_step_sec": effective_step_sec,
+            "analysis_start_sec": analysis_start / sampling_rate if sampling_rate > 0 else 0.0,
             "preset": config.get("_preset_name", "default"),
         }
 
@@ -654,8 +888,14 @@ def analyze_holter_quality(
     # Aggregate raw measurement values from ALL windows
     _value_keys = [
         "m_a",
+        "m_a_hf_power",
+        "m_a_broadband_hf_power",
         "b_e_c",
         "p_i",
+        "p_i_db",
+        "periodic_artifact_ratio",
+        "periodic_artifact_freq",
+        "periodic_artifact_context",
         "b_d",
         "snr",
         "qrs_amp",
@@ -731,6 +971,8 @@ def analyze_holter_quality(
     lead2_values_agg["nk_long_gap_ratio"] = 0.0
     lead1_values_agg["nk_max_gap_sec"] = 0.0
     lead2_values_agg["nk_max_gap_sec"] = 0.0
+    lead1_values_agg["readability_guard_support"] = 0.0
+    lead2_values_agg["readability_guard_support"] = 0.0
     duration_sec = n / sampling_rate if sampling_rate > 0 else 0.0
     for lead_nk_peaks, lead_nk_positions, lead_num in [
         (lead1_nk_r_peaks, lead1_nk_positions, 1),
@@ -788,6 +1030,31 @@ def analyze_holter_quality(
     lead1_values_agg["nk_r_peaks_count"] = lead1_nk_r_peaks
     lead2_values_agg["nk_r_peaks_count"] = lead2_nk_r_peaks
 
+    # Guard against false low-gain penalties when NK confirms the lead is readable.
+    agg_flags1, lead1_values_agg = _apply_readability_guard(
+        agg_flags1,
+        lead1_values_agg,
+        lead1_nk_quality,
+    )
+    agg_flags2, lead2_values_agg = _apply_readability_guard(
+        agg_flags2,
+        lead2_values_agg,
+        lead2_nk_quality,
+    )
+
+    q1_flag_score = compute_quality_score(
+        {k: v for k, v in agg_flags1.items() if k != "NK_Peak_Consistency"},
+        config=config,
+    )
+    q2_flag_score = compute_quality_score(
+        {k: v for k, v in agg_flags2.items() if k != "NK_Peak_Consistency"},
+        config=config,
+    )
+    q1_score = max(q1_score, q1_flag_score)
+    q2_score = max(q2_score, q2_flag_score)
+    q1_psd_all = max(q1_psd_all, q1_flag_score)
+    q2_psd_all = max(q2_psd_all, q2_flag_score)
+
     # Blend aggregated lead score with NK (whole-signal) for final scores.
     nk_weight = nk_cfg.get("weight", 0.0) if nk_cfg.get("enabled", False) else 0.0
     q1_avg = q1_score
@@ -827,6 +1094,7 @@ def analyze_holter_quality(
         "lead2_window_stats": q2_window_stats,
         "window_length_sec": effective_window_sec,
         "window_step_sec": effective_step_sec,
+        "analysis_start_sec": analysis_start / sampling_rate if sampling_rate > 0 else 0.0,
         "quality_best_lead": 1 if q1_avg >= q2_avg else 2,
         "lead1_nk_quality": lead1_nk_quality,
         "lead2_nk_quality": lead2_nk_quality,
