@@ -7,12 +7,16 @@ and quality analysis from Ecg-Interpretation-Python-Service.
 """
 
 import glob
+import json
 import os
 import re
+import warnings
 
 import numpy as np
 import plotly.graph_objects as go
+import requests
 import streamlit as st
+import urllib3
 from plotly.subplots import make_subplots
 from src.dat_parser import are_files_consecutive, parse_dat_file
 from src.filters import preprocess_dat_signal
@@ -419,6 +423,21 @@ with st.sidebar:
         )
 
         process_btn = st.button("Analyze", type="primary", width="stretch")
+
+        st.divider()
+        st.header("API Validation")
+
+        api_base_url = st.text_input(
+            "API Base URL",
+            value=st.session_state.get("api_base_url", "https://devgateway.commwellmedical.com"),
+            key="api_base_url",
+        )
+        api_bearer_token = st.text_input(
+            "Bearer Token",
+            type="password",
+            key="api_bearer_token",
+        )
+        validate_api_btn = st.button("Validate via API", width="stretch")
 
     # ---- Config Tab ----
     with sidebar_config_tab:
@@ -1088,6 +1107,65 @@ if "results" not in st.session_state:
     st.info(f"{len(dat_files_data)} files loaded. Click **Analyze** to process.")
     st.stop()
 
+# -- API Validation ------------------------------------------------------------
+
+if validate_api_btn:
+    if "results" not in st.session_state:
+        st.warning("Run **Analyze** first before validating via API.")
+        st.stop()
+    token = st.session_state.get("api_bearer_token", "").strip()
+    base_url = st.session_state.get("api_base_url", "").strip().rstrip("/")
+    if not token:
+        st.error("Bearer token is required for API validation.")
+        st.stop()
+    if not base_url:
+        st.error("API Base URL is required.")
+        st.stop()
+
+    api_url = f"{base_url}/api/v1/ecg-interpretation/check-holter-quality"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    api_results = {}
+    local_results = st.session_state["results"]
+    progress = st.progress(0, text="Validating via API...")
+
+    for idx, (fname, result) in enumerate(local_results.items()):
+        progress.progress((idx + 1) / len(local_results), text=f"API: {fname}...")
+        lead1 = result["lead1"]
+        lead2 = result["lead2"]
+        payload = {
+            "lead1Data": lead1.tolist(),
+            "lead2Data": lead2.tolist(),
+            "samplingRate": 200,
+        }
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
+                resp = requests.post(
+                    api_url, json=payload, headers=headers,
+                    verify=False, timeout=30,
+                )
+            if resp.status_code == 200:
+                api_results[fname] = {"success": True, "data": resp.json()}
+            else:
+                api_results[fname] = {
+                    "success": False,
+                    "error": f"HTTP {resp.status_code}: {resp.text[:500]}",
+                }
+        except requests.exceptions.ConnectionError:
+            api_results[fname] = {
+                "success": False,
+                "error": f"Connection failed to {api_url}",
+            }
+        except Exception as e:
+            api_results[fname] = {"success": False, "error": str(e)}
+
+    progress.empty()
+    st.session_state["api_results"] = api_results
+
 all_results = st.session_state["results"]
 
 # -- Results display -----------------------------------------------------------
@@ -1115,6 +1193,44 @@ for tab, (fname, result) in zip(tabs, all_results.items()):
             )
         with col4:
             st.metric("Best Lead", f"Lead {best}")
+
+        # -- API Validation results --
+        api_results = st.session_state.get("api_results", {})
+        if fname in api_results:
+            api_res = api_results[fname]
+            with st.expander("API Validation", expanded=True):
+                if api_res["success"]:
+                    api_data = api_res["data"]
+                    api_score = api_data.get("overallQuality", api_data.get("overall_quality"))
+                    api_grade = api_data.get("grade")
+
+                    cmp1, cmp2, cmp3 = st.columns(3)
+                    with cmp1:
+                        st.markdown("**Source**")
+                        st.write("Local")
+                        st.write("API")
+                    with cmp2:
+                        st.markdown("**Quality Score**")
+                        st.write(f"{q['overall_quality']:.3f}")
+                        st.write(f"{api_score:.3f}" if api_score is not None else "N/A")
+                    with cmp3:
+                        st.markdown("**Grade**")
+                        st.write(q["grade"])
+                        st.write(api_grade if api_grade else "N/A")
+
+                    if api_score is not None:
+                        diff = q["overall_quality"] - api_score
+                        if abs(diff) < 0.01:
+                            st.success(f"Scores match (diff: {diff:+.4f})")
+                        elif abs(diff) < 0.05:
+                            st.warning(f"Minor difference: {diff:+.4f}")
+                        else:
+                            st.error(f"Significant difference: {diff:+.4f}")
+
+                    with st.expander("Raw API Response"):
+                        st.json(api_data)
+                else:
+                    st.error(f"API call failed: {api_res['error']}")
 
         # -- Quality details --
         with st.expander("Quality Details", expanded=True):
