@@ -87,6 +87,16 @@ _FALLBACK_CONFIG: Dict[str, Any] = {
         "max_bonus": 0.18,
         "legacy_max_bonus": 0.0,
     },
+    "clean_no_peak_fallback": {
+        "enabled": True,
+        "window_quality_min": 0.90,
+        "coverage_min": 0.95,
+        "window_std_max": 0.08,
+        "noise_max": 0.10,
+        "low_snr_max": 0.10,
+        "bad_electrode_max": 0.10,
+        "baseline_max": 0.60,
+    },
     "lead_aggregation": {
         "readable_threshold": 0.65,
         "mean_weight": 0.60,
@@ -336,6 +346,7 @@ def analyze_lead_quality(
 
     # Low SNR should reflect whether visible QRS energy clearly stands out from
     # high-frequency noise on the already filtered display signal.
+    snr_calc_failed = 0.0
     try:
         signal_hi = min(25, sampling_rate / 2 - 1)
         noise_hi = min(80, sampling_rate / 2 - 1)
@@ -349,19 +360,14 @@ def analyze_lead_quality(
         noise_rms = float(np.sqrt(np.mean(noise_band**2)) + 1e-12)
         snr = 20 * np.log10(qrs_amp / noise_rms) if noise_rms > 0 else 60.0
 
-        flags["Low_SNR"] = float(
-            np.clip(
-                (snr - t_grades["Low_SNR"][0])
-                / (t_grades["Low_SNR"][1] - t_grades["Low_SNR"][0]),
-                0,
-                1,
-            )
-        )
-    except Exception:
-        qrs_amp = 0.0
+        flags["Low_SNR"] = _map_low_snr_flag(snr, t_grades)
+    except Exception as exc:
+        snr_calc_failed = 1.0
+        qrs_amp = float(np.percentile(sig, 95) - np.percentile(sig, 5))
         noise_rms = float(np.sqrt(np.mean(sig**2)) + 1e-12)
-        snr = 0.0
-        flags["Low_SNR"] = 1.0
+        snr = 20 * np.log10(max(qrs_amp, 1e-12) / noise_rms) if noise_rms > 0 else 0.0
+        flags["Low_SNR"] = _map_low_snr_flag(snr, t_grades)
+        logger.warning("Low_SNR fallback used: %s", exc)
 
     periodic_raw = float(
         np.clip(
@@ -409,6 +415,7 @@ def analyze_lead_quality(
             "baseline_visible_ratio": visible_ratio,
             "baseline_visible_flag_raw": baseline_visible_flag,
             "snr": snr,
+            "snr_calc_failed": snr_calc_failed,
             "qrs_amp": amp,
             "qrs_band_amp": qrs_amp,
             "hf_noise_rms": noise_rms,
@@ -461,6 +468,21 @@ def _map_powerline_db_to_unit(mains_db: float) -> float:
     if mains_db <= 10.0:
         return float(0.66 + mains_db / 10.0 * 0.34)
     return 1.0
+
+
+def _map_low_snr_flag(
+    snr_db: float,
+    thresholds: Dict[str, Tuple[float, float]],
+) -> float:
+    """Map SNR in dB to the normalized Low_SNR severity."""
+    low_snr = thresholds["Low_SNR"]
+    return float(
+        np.clip(
+            (snr_db - low_snr[0]) / (low_snr[1] - low_snr[0]),
+            0.0,
+            1.0,
+        )
+    )
 
 
 def _iter_window_bounds(n_samples: int, wlen: int, step: int) -> list[Tuple[int, int]]:
@@ -577,6 +599,28 @@ def _compute_peak_unreliability(values: Dict[str, float]) -> float:
             0.0,
             1.0,
         )
+    )
+
+
+def _should_keep_clean_no_peak_score(
+    window_score: float,
+    window_stats: Dict[str, float],
+    flags: Dict[str, float],
+    config: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Keep PSD-based quality for clean non-QRS rhythms when NK finds no peaks."""
+    cfg = (config or {}).get("clean_no_peak_fallback", {})
+    if not bool(cfg.get("enabled", True)):
+        return False
+
+    return bool(
+        window_score >= float(cfg.get("window_quality_min", 0.90))
+        and float(window_stats.get("coverage", 0.0)) >= float(cfg.get("coverage_min", 0.95))
+        and float(window_stats.get("std", 1.0)) <= float(cfg.get("window_std_max", 0.08))
+        and float(flags.get("Noise_Artifact", 1.0)) <= float(cfg.get("noise_max", 0.10))
+        and float(flags.get("Low_SNR", 1.0)) <= float(cfg.get("low_snr_max", 0.10))
+        and float(flags.get("Bad_Electrode_Contact", 1.0)) <= float(cfg.get("bad_electrode_max", 0.10))
+        and float(flags.get("Baseline_Drift", 1.0)) <= float(cfg.get("baseline_max", 0.60))
     )
 
 
@@ -870,6 +914,7 @@ def analyze_holter_quality(
             "periodic_flag_raw": 0.0,
             "b_d": 0.0,
             "snr": 0.0,
+            "snr_calc_failed": 0.0,
             "qrs_amp": 0.0,
             "qrs_band_amp": 0.0,
             "hf_noise_rms": 0.0,
@@ -882,10 +927,16 @@ def analyze_holter_quality(
             "nk_peak_span_ratio": 0.0,
             "nk_long_gap_ratio": 0.0,
             "nk_max_gap_sec": 0.0,
-            "peak_consistency_proxy": 1.0,
+            "peak_consistency_proxy": 0.0,
             "peak_consistency_count": 0.0,
             "readability_support": 0.0,
             "readability_bonus": 0.0,
+            "nk_detection_ok": 0.0,
+            "nk_detection_failed": 0.0,
+            "nk_detection_skipped": 0.0,
+            "nk_quality_failed": 0.0,
+            "nk_penalty_suppressed": 0.0,
+            "clean_no_peak_fallback_applied": 0.0,
             "window_quality": 0.0,
         }
         return {
@@ -1014,6 +1065,7 @@ def analyze_holter_quality(
         "baseline_visible_ratio",
         "baseline_visible_flag_raw",
         "snr",
+        "snr_calc_failed",
         "qrs_amp",
         "qrs_band_amp",
         "hf_noise_rms",
@@ -1033,42 +1085,70 @@ def analyze_holter_quality(
     lead2_nk_r_peaks = 0
     lead1_nk_positions = np.empty(0, dtype=np.int32)
     lead2_nk_positions = np.empty(0, dtype=np.int32)
+    lead1_nk_detection_ok = False
+    lead2_nk_detection_ok = False
+    lead1_nk_detection_failed = False
+    lead2_nk_detection_failed = False
+    lead1_nk_detection_skipped = False
+    lead2_nk_detection_skipped = False
+    lead1_nk_quality_failed = False
+    lead2_nk_quality_failed = False
     nk_min_samples = sampling_rate * 4  # ecg_segment() minimum
     for lead_sig, lead_num in [(lead1[:n], 1), (lead2[:n], 2)]:
+        r_peaks = np.empty(0, dtype=np.int32)
+        nk_q = None
+        nk_detection_ok = False
+        nk_detection_failed = False
+        nk_detection_skipped = False
+        nk_quality_failed = False
         if len(lead_sig) < nk_min_samples:
             logger.debug(
                 "Lead %d too short for NeuroKit2 (%d < %d), skipping",
                 lead_num, len(lead_sig), nk_min_samples,
             )
-            continue
-        try:
-            import neurokit2 as nk
+            nk_detection_skipped = True
+        else:
+            try:
+                import neurokit2 as nk
 
-            cleaned = nk.ecg_clean(lead_sig, sampling_rate=sampling_rate)
-            _, peaks_info = nk.ecg_peaks(cleaned, sampling_rate=sampling_rate)
-            r_peaks = list(peaks_info.get("ECG_R_Peaks", []))
-            nk_q = None
-            if nk_cfg.get("enabled", False):
-                quality_arr = nk.ecg_quality(
-                    cleaned,
-                    rpeaks=peaks_info.get("ECG_R_Peaks"),
-                    sampling_rate=sampling_rate,
-                    method=nk_cfg.get("method", "averageQRS"),
-                )
-                quality_arr = np.asarray(quality_arr, dtype=float)
-                nk_q = float(np.clip(np.nanmean(quality_arr), 0.0, 1.0))
-                if not np.isfinite(nk_q):
-                    raise ValueError("NeuroKit quality is NaN/Inf")
-            if lead_num == 1:
-                lead1_nk_quality = nk_q
-                lead1_nk_r_peaks = len(r_peaks)
-                lead1_nk_positions = np.asarray(r_peaks, dtype=np.int32)
-            else:
-                lead2_nk_quality = nk_q
-                lead2_nk_r_peaks = len(r_peaks)
-                lead2_nk_positions = np.asarray(r_peaks, dtype=np.int32)
-        except Exception as exc:
-            logger.warning("NeuroKit2 detection/quality failed for lead %d: %s", lead_num, exc)
+                cleaned = nk.ecg_clean(lead_sig, sampling_rate=sampling_rate)
+                _, peaks_info = nk.ecg_peaks(cleaned, sampling_rate=sampling_rate)
+                r_peaks = np.asarray(peaks_info.get("ECG_R_Peaks", []), dtype=np.int32)
+                nk_detection_ok = True
+                if nk_cfg.get("enabled", False) and r_peaks.size >= 4:
+                    try:
+                        quality_arr = nk.ecg_quality(
+                            cleaned,
+                            rpeaks=r_peaks,
+                            sampling_rate=sampling_rate,
+                            method=nk_cfg.get("method", "averageQRS"),
+                        )
+                        quality_arr = np.asarray(quality_arr, dtype=float)
+                        nk_q = float(np.clip(np.nanmean(quality_arr), 0.0, 1.0))
+                        if not np.isfinite(nk_q):
+                            raise ValueError("NeuroKit quality is NaN/Inf")
+                    except Exception as exc:
+                        nk_quality_failed = True
+                        logger.warning("NeuroKit2 quality failed for lead %d: %s", lead_num, exc)
+            except Exception as exc:
+                nk_detection_failed = True
+                logger.warning("NeuroKit2 detection failed for lead %d: %s", lead_num, exc)
+        if lead_num == 1:
+            lead1_nk_quality = nk_q
+            lead1_nk_r_peaks = len(r_peaks)
+            lead1_nk_positions = r_peaks
+            lead1_nk_detection_ok = nk_detection_ok
+            lead1_nk_detection_failed = nk_detection_failed
+            lead1_nk_detection_skipped = nk_detection_skipped
+            lead1_nk_quality_failed = nk_quality_failed
+        else:
+            lead2_nk_quality = nk_q
+            lead2_nk_r_peaks = len(r_peaks)
+            lead2_nk_positions = r_peaks
+            lead2_nk_detection_ok = nk_detection_ok
+            lead2_nk_detection_failed = nk_detection_failed
+            lead2_nk_detection_skipped = nk_detection_skipped
+            lead2_nk_quality_failed = nk_quality_failed
 
     # NK peak consistency — use only NeuroKit peaks and RR plausibility.
     lead1_values_agg["nk_rr_median_sec"] = 0.0
@@ -1085,8 +1165,8 @@ def analyze_holter_quality(
     lead2_values_agg["nk_long_gap_ratio"] = 0.0
     lead1_values_agg["nk_max_gap_sec"] = 0.0
     lead2_values_agg["nk_max_gap_sec"] = 0.0
-    lead1_values_agg["peak_consistency_proxy"] = 1.0
-    lead2_values_agg["peak_consistency_proxy"] = 1.0
+    lead1_values_agg["peak_consistency_proxy"] = 0.0
+    lead2_values_agg["peak_consistency_proxy"] = 0.0
     lead1_values_agg["peak_consistency_count"] = 0.0
     lead2_values_agg["peak_consistency_count"] = 0.0
     lead1_values_agg["nk_peak_to_mad"] = 0.0
@@ -1097,8 +1177,8 @@ def analyze_holter_quality(
     lead2_values_agg["nk_morph_median_corr"] = 0.0
     lead1_values_agg["nk_morph_support"] = 0.0
     lead2_values_agg["nk_morph_support"] = 0.0
-    lead1_values_agg["nk_morph_unreliability"] = 1.0
-    lead2_values_agg["nk_morph_unreliability"] = 1.0
+    lead1_values_agg["nk_morph_unreliability"] = 0.0
+    lead2_values_agg["nk_morph_unreliability"] = 0.0
     lead1_values_agg["readability_support"] = 0.0
     lead2_values_agg["readability_support"] = 0.0
     lead1_values_agg["readability_bonus"] = 0.0
@@ -1109,11 +1189,25 @@ def analyze_holter_quality(
     lead2_values_agg["readability_relief_bonus"] = 0.0
     lead1_values_agg["nk_zero_cap_applied"] = 0.0
     lead2_values_agg["nk_zero_cap_applied"] = 0.0
+    lead1_values_agg["nk_detection_ok"] = float(lead1_nk_detection_ok)
+    lead2_values_agg["nk_detection_ok"] = float(lead2_nk_detection_ok)
+    lead1_values_agg["nk_detection_failed"] = float(lead1_nk_detection_failed)
+    lead2_values_agg["nk_detection_failed"] = float(lead2_nk_detection_failed)
+    lead1_values_agg["nk_detection_skipped"] = float(lead1_nk_detection_skipped)
+    lead2_values_agg["nk_detection_skipped"] = float(lead2_nk_detection_skipped)
+    lead1_values_agg["nk_quality_failed"] = float(lead1_nk_quality_failed)
+    lead2_values_agg["nk_quality_failed"] = float(lead2_nk_quality_failed)
+    lead1_values_agg["nk_penalty_suppressed"] = 0.0
+    lead2_values_agg["nk_penalty_suppressed"] = 0.0
+    lead1_values_agg["clean_no_peak_fallback_applied"] = 0.0
+    lead2_values_agg["clean_no_peak_fallback_applied"] = 0.0
     duration_sec = n / sampling_rate if sampling_rate > 0 else 0.0
-    for lead_nk_positions, lead_num in [
-        (lead1_nk_positions, 1),
-        (lead2_nk_positions, 2),
+    for lead_nk_positions, lead_num, nk_detection_ok in [
+        (lead1_nk_positions, 1, lead1_nk_detection_ok),
+        (lead2_nk_positions, 2, lead2_nk_detection_ok),
     ]:
+        if not nk_detection_ok:
+            continue
         severity, peak_info = _compute_nk_peak_consistency(
             lead_nk_positions,
             sampling_rate,
@@ -1208,6 +1302,26 @@ def analyze_holter_quality(
     low_gain_min_support = float(lead_agg_cfg.get("low_gain_min_support", 0.80))
     q1_peak_unreliability = _compute_peak_unreliability(lead1_values_agg)
     q2_peak_unreliability = _compute_peak_unreliability(lead2_values_agg)
+    if not lead1_nk_detection_ok:
+        q1_peak_unreliability = 0.0
+        lead1_values_agg["nk_penalty_suppressed"] = 1.0
+    if not lead2_nk_detection_ok:
+        q2_peak_unreliability = 0.0
+        lead2_values_agg["nk_penalty_suppressed"] = 1.0
+    q1_clean_no_peak_fallback = (
+        lead1_nk_r_peaks == 0
+        and _should_keep_clean_no_peak_score(q1_window_score, q1_window_stats, agg_flags1, config)
+    )
+    q2_clean_no_peak_fallback = (
+        lead2_nk_r_peaks == 0
+        and _should_keep_clean_no_peak_score(q2_window_score, q2_window_stats, agg_flags2, config)
+    )
+    if q1_clean_no_peak_fallback:
+        q1_peak_unreliability = 0.0
+        lead1_values_agg["clean_no_peak_fallback_applied"] = 1.0
+    if q2_clean_no_peak_fallback:
+        q2_peak_unreliability = 0.0
+        lead2_values_agg["clean_no_peak_fallback_applied"] = 1.0
     if (
         lead1_values_agg["readability_support"] >= low_gain_min_support
         and q1_window_score <= low_gain_max_base
@@ -1291,12 +1405,12 @@ def analyze_holter_quality(
         lead1_values_agg["readability_relief_gate"] = q1_relief_gate
         lead2_values_agg["readability_relief_gate"] = q2_relief_gate
 
-    if lead1_nk_r_peaks == 0:
+    if lead1_nk_detection_ok and lead1_nk_r_peaks == 0 and not q1_clean_no_peak_fallback:
         q1_window_score = min(q1_window_score, 0.25)
         q1_bonus = 0.0
         q1_relief_bonus = 0.0
         lead1_values_agg["nk_zero_cap_applied"] = 1.0
-    if lead2_nk_r_peaks == 0:
+    if lead2_nk_detection_ok and lead2_nk_r_peaks == 0 and not q2_clean_no_peak_fallback:
         q2_window_score = min(q2_window_score, 0.25)
         q2_bonus = 0.0
         q2_relief_bonus = 0.0
